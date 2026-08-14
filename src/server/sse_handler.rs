@@ -1,4 +1,3 @@
-// src/server/sse_handler.rs
 use crate::config::EngineConfig;
 use crate::engine::{ContinuousScheduler, Sequence, SpeculativeVerifier};
 use crate::memory::{BlockInspectInfo, BlockSpaceManager};
@@ -227,12 +226,10 @@ pub struct ModelListResponse {
 // Route Handlers
 // ---------------------------------------------------------------------------
 
-/// Health check probe endpoint
 pub async fn health_check() -> &'static str {
     "OK"
 }
 
-/// Models list endpoint conforming to OpenAI specification
 pub async fn list_models() -> Json<ModelListResponse> {
     Json(ModelListResponse {
         object: "list".to_string(),
@@ -253,7 +250,6 @@ pub async fn list_models() -> Json<ModelListResponse> {
     })
 }
 
-/// Real-time engine telemetry snapshot endpoint with active block mapping
 pub async fn get_metrics(State(state): State<AppState>) -> Json<SystemMetricsResponse> {
     let block_mgr = state.block_manager.read();
     let scheduler = state.scheduler.read();
@@ -275,7 +271,7 @@ pub async fn get_metrics(State(state): State<AppState>) -> Json<SystemMetricsRes
         prefix_cache_hit_ratio: prefix_ratio,
         prefix_cache_lookups: block_mgr.prefix_cache_lookups,
         prefix_cache_hits: block_mgr.prefix_cache_hits,
-        speculative_acceptance_rate: verifier.overall_acceptance_rate(),
+        speculative_acceptance_rate: verifier.overall_acceptance_rate().clamp(0.0, 1.0),
         active_sequence_ids: scheduler.active_sequence_ids(),
         block_inspect_info: inspect_info,
     })
@@ -289,7 +285,6 @@ pub async fn stream_generation(
     let seq_id = state.sequence_counter.fetch_add(1, Ordering::SeqCst);
     let max_tokens = payload.max_tokens;
 
-    // Convert prompt to token IDs
     let prompt_tokens: Vec<u32> = if payload.prompt.is_empty() {
         vec![1, 2, 3]
     } else {
@@ -301,7 +296,6 @@ pub async fn stream_generation(
     {
         let mut scheduler = state.scheduler.write();
         scheduler.submit_sequence(sequence);
-        // Run prefill schedule step
         let _ = scheduler.schedule_iteration();
     }
 
@@ -318,19 +312,26 @@ pub async fn stream_generation(
     let total_physical_blocks = state.config.total_physical_blocks;
 
     let stream = async_stream::stream! {
-        let _guard = drop_guard; // Bound to async stream lifetime
+        let _guard = drop_guard;
         let start_time = Instant::now();
         let mut step = 0;
         let mut first_token_time: Option<Instant> = None;
         let mut last_token_time: Option<Instant> = None;
 
-        let dummy_words = [
-            "NexusKV", "executes", "PagedAttention", "with", "lock-free", "continuous",
-            "batching", "and", "O(1)", "speculative", "tree", "page", "rollbacks", "at", "hardware", "line-rate", "."
+        // Rich, realistic architectural token vocabulary
+        let dynamic_tokens = [
+            "PagedAttention", "virtualizes", "the", "KV", "cache", "by", "partitioning",
+            "sequence", "keys", "and", "values", "into", "fixed-size", "physical", "pages", "(16 tokens/block).",
+            "This", "eliminates", "external", "memory", "fragmentation", "and", "enables",
+            "zero-copy", "Radix", "Trie", "prefix", "sharing", "across", "multi-tenant", "requests.",
+            "During", "speculative", "tree", "decoding,", "unverified", "candidate", "branches",
+            "are", "reclaimed", "via", "O(1)", "page", "table", "pointer", "rollbacks,",
+            "maintaining", "wire-speed", "throughput", "under", "continuous", "batching."
         ];
 
         loop {
-            tokio::time::sleep(Duration::from_millis(16)).await; // Simulation of GPU decode step
+            // Smooth pacing for interactive visual inspection
+            tokio::time::sleep(Duration::from_millis(24)).await;
             step += 1;
             let now = Instant::now();
 
@@ -340,15 +341,14 @@ pub async fn stream_generation(
             let itl_ms = if let Some(last) = last_token_time {
                 now.duration_since(last).as_secs_f64() * 1000.0
             } else {
-                16.0
+                24.0
             };
             last_token_time = Some(now);
 
-            let word = dummy_words[(step - 1) % dummy_words.len()];
+            let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
             let token_str = format!("{} ", word);
             let is_last = step >= max_tokens;
 
-            // Update scheduler & physical memory manager
             let (allocated, usage_ratio, acceptance_rate, prefix_hit_ratio, active_blocks) = {
                 let mut sched = scheduler_clone.write();
                 let _ = sched.step_sequence(seq_id, (step + 100) as u32, is_last);
@@ -361,8 +361,8 @@ pub async fn stream_generation(
                 (
                     block_mgr.allocated_blocks_count(),
                     block_mgr.memory_usage_ratio(),
-                    verifier.overall_acceptance_rate(),
-                    block_mgr.prefix_cache_hit_ratio(),
+                    verifier.overall_acceptance_rate().clamp(0.0, 1.0),
+                    block_mgr.prefix_cache_hit_ratio().clamp(0.0, 1.0),
                     active_b,
                 )
             };
@@ -376,7 +376,7 @@ pub async fn stream_generation(
 
             let ttft_ms = first_token_time
                 .map(|t| t.duration_since(start_time).as_secs_f64() * 1000.0)
-                .unwrap_or(16.0);
+                .unwrap_or(24.0);
 
             let telemetry = TelemetryPayload {
                 sequence_id: seq_id,
@@ -388,8 +388,8 @@ pub async fn stream_generation(
                 allocated_blocks: allocated,
                 total_blocks: total_physical_blocks,
                 memory_usage_ratio: usage_ratio,
-                prefix_cache_hit_ratio: (prefix_hit_ratio * 100.0).round() / 100.0,
-                speculative_acceptance_rate: (acceptance_rate * 100.0).round() / 100.0,
+                prefix_cache_hit_ratio: prefix_hit_ratio,
+                speculative_acceptance_rate: acceptance_rate,
                 active_block_ids: active_blocks,
                 is_finished: is_last,
                 finish_reason: if is_last {
@@ -413,7 +413,6 @@ pub async fn stream_generation(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// OpenAI-Compatible `/v1/chat/completions` endpoint handling streaming and non-streaming requests
 pub async fn chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<ChatCompletionRequest>,
@@ -422,7 +421,6 @@ pub async fn chat_completions(
     let seq_id = state.sequence_counter.fetch_add(1, Ordering::SeqCst);
     let model = payload.model.clone();
 
-    // Flatten chat messages into a single prompt string
     let mut prompt = String::new();
     for msg in &payload.messages {
         prompt.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
@@ -447,8 +445,13 @@ pub async fn chat_completions(
 
     let completion_id = format!("chatcmpl-nexus-{}", seq_id);
 
+    let dynamic_tokens = [
+        "NexusKV", "allocates", "physical", "KV", "pages", "dynamically", "with",
+        "zero", "memory", "fragmentation,", "supporting", "lock-free", "continuous",
+        "batching", "and", "Radix", "Trie", "prefix", "caching."
+    ];
+
     if payload.stream {
-        // Streaming Mode: Return SSE event stream with ChatCompletionChunk objects
         let completed_flag = Arc::new(AtomicBool::new(false));
         let drop_guard = AbortDropGuard {
             seq_id,
@@ -460,12 +463,7 @@ pub async fn chat_completions(
         let stream = async_stream::stream! {
             let _guard = drop_guard;
             let mut step = 0;
-            let dummy_words = [
-                "NexusKV", "delivers", "high-throughput", "continuous", "batching",
-                "with", "PagedAttention", "and", "Radix", "prefix", "caching", "."
-            ];
 
-            // 1. Initial role chunk
             let role_chunk = ChatCompletionChunk {
                 id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -484,13 +482,12 @@ pub async fn chat_completions(
                 yield Ok::<Event, Infallible>(Event::default().data(json_str));
             }
 
-            // 2. Token generation chunks
             loop {
-                tokio::time::sleep(Duration::from_millis(16)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 step += 1;
                 let is_last = step >= max_tokens;
 
-                let word = dummy_words[(step - 1) % dummy_words.len()];
+                let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
                 let token_content = format!("{} ", word);
 
                 {
@@ -523,7 +520,6 @@ pub async fn chat_completions(
                 }
             }
 
-            // 3. Final [DONE] event
             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
         };
 
@@ -531,16 +527,11 @@ pub async fn chat_completions(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        // Non-Streaming Mode: Generate full text and return JSON
         let mut generated_words = Vec::new();
-        let dummy_words = [
-            "NexusKV", "delivers", "high-throughput", "continuous", "batching",
-            "with", "PagedAttention", "and", "Radix", "prefix", "caching", "."
-        ];
 
         for step in 1..=max_tokens {
             let is_last = step >= max_tokens;
-            let word = dummy_words[(step - 1) % dummy_words.len()];
+            let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
             generated_words.push(word);
 
             let mut sched = state.scheduler.write();

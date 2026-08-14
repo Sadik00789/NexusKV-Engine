@@ -1,8 +1,7 @@
-// dashboard/src/components/VramBlockCanvas.tsx
 "use client";
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
-import { Info, Layers, RefreshCw, Sparkles, Database } from "lucide-react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { Info, Layers, Database } from "lucide-react";
 
 export interface BlockInspectData {
     block_id: number;
@@ -15,7 +14,7 @@ export interface BlockInspectData {
 
 interface VramBlockCanvasProps {
     allocatedBlocks: number;
-    totalBlocks: number;
+    totalBlocks?: number;
     acceptanceRate: number;
     activeSequenceId?: number;
     activeBlockIds?: number[];
@@ -48,41 +47,52 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
     const [selectedBlock, setSelectedBlock] = useState<BlockInspectData | null>(null);
     const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
 
+    // Defensive mathematical sanitization
+    const safeTotal = Math.max(1, totalBlocks || 512);
+    const safeAllocated = Number.isFinite(allocatedBlocks)
+        ? Math.min(safeTotal, Math.max(0, allocatedBlocks))
+        : 0;
+
+    const activePercent = ((safeAllocated / safeTotal) * 100).toFixed(1);
+
     const cols = 32;
-    const rows = Math.ceil(totalBlocks / cols);
+    const rows = Math.ceil(safeTotal / cols);
     const blockSize = 14;
     const gap = 3;
 
-    // Helper to get color for a physical block
+    // Fast lookup set for active blocks
+    const activeBlockSet = useMemo(() => new Set(activeBlockIds), [activeBlockIds]);
+
+    // Helper to determine color for each physical block
     const getBlockColor = useCallback(
         (blockId: number, meta?: BlockInspectData): string => {
             if (meta) {
                 if (meta.is_free) return "#1E293B"; // Slate-800
-                if (meta.is_prefix_cached && meta.ref_count > 1) return "#6366F1"; // Indigo (Shared Prefix)
+                if (meta.is_prefix_cached && meta.ref_count > 1) return "#6366F1"; // Indigo (Radix Prefix)
                 if (meta.is_speculative) return "#F59E0B"; // Amber (Draft Speculation)
                 if (meta.mapped_seq_id !== null) {
-                    const colorIdx = (meta.mapped_seq_id - 1) % SEQUENCE_COLORS.length;
+                    const colorIdx = Math.abs(meta.mapped_seq_id - 1) % SEQUENCE_COLORS.length;
                     return SEQUENCE_COLORS[colorIdx];
                 }
                 return "#10B981"; // Emerald
             }
 
-            // Fallback heuristics when metadata is streaming
-            if (activeBlockIds.includes(blockId)) {
+            // Fallback heuristics during live SSE streaming
+            if (activeBlockSet.has(blockId)) {
                 if (activeSequenceId) {
-                    const colorIdx = (activeSequenceId - 1) % SEQUENCE_COLORS.length;
+                    const colorIdx = Math.abs(activeSequenceId - 1) % SEQUENCE_COLORS.length;
                     return SEQUENCE_COLORS[colorIdx];
                 }
                 return "#10B981";
             }
 
-            if (blockId < allocatedBlocks) {
+            if (blockId < safeAllocated) {
                 return acceptanceRate > 0.8 ? "#10B981" : "#F59E0B";
             }
 
             return "#1E293B";
         },
-        [allocatedBlocks, acceptanceRate, activeSequenceId, activeBlockIds]
+        [safeAllocated, acceptanceRate, activeSequenceId, activeBlockSet]
     );
 
     // Render Canvas
@@ -92,7 +102,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
 
-        const dpr = window.devicePixelRatio || 1;
+        const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
         const width = cols * (blockSize + gap) - gap;
         const height = rows * (blockSize + gap) - gap;
 
@@ -104,7 +114,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, width, height);
 
-        for (let i = 0; i < totalBlocks; i++) {
+        for (let i = 0; i < safeTotal; i++) {
             const col = i % cols;
             const row = Math.floor(i / cols);
             const x = col * (blockSize + gap);
@@ -133,8 +143,8 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
             }
         }
     }, [
-        totalBlocks,
-        allocatedBlocks,
+        safeTotal,
+        safeAllocated,
         acceptanceRate,
         hoveredBlock,
         selectedBlock,
@@ -158,20 +168,25 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
 
         if (col >= 0 && col < cols && row >= 0 && row < rows) {
             const blockId = row * cols + col;
-            if (blockId < totalBlocks) {
+            if (blockId < safeTotal) {
+                const isActive = activeBlockSet.has(blockId) || blockId < safeAllocated;
                 const meta = blocksMetadata?.[blockId] ?? {
                     block_id: blockId,
-                    ref_count: blockId < allocatedBlocks ? 1 : 0,
-                    is_free: blockId >= allocatedBlocks,
-                    mapped_seq_id:
-                        blockId < allocatedBlocks
-                            ? activeSequenceId ?? ((blockId % 3) + 1)
-                            : null,
-                    is_prefix_cached: blockId < allocatedBlocks && blockId % 4 === 0,
+                    ref_count: isActive ? 1 : 0,
+                    is_free: !isActive,
+                    mapped_seq_id: isActive
+                        ? activeSequenceId ?? ((blockId % 3) + 1)
+                        : null,
+                    is_prefix_cached: isActive && blockId % 4 === 0,
                     is_speculative: false,
                 };
+
                 setHoveredBlock(meta);
-                setTooltipPos({ x: e.clientX - rect.left + 15, y: e.clientY - rect.top + 15 });
+
+                // Ensure tooltip stays within container bounds
+                const posX = Math.min(e.clientX - rect.left + 15, rect.width - 220);
+                const posY = Math.max(10, e.clientY - rect.top - 70);
+                setTooltipPos({ x: Math.max(10, posX), y: posY });
                 return;
             }
         }
@@ -206,7 +221,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
                         Physical VRAM Page Map
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                        {totalBlocks} Physical Pages @ 16 tokens/block (Non-contiguous CUDA PagedAttention)
+                        {safeTotal} Physical Pages @ 16 tokens/block (Non-contiguous CUDA PagedAttention)
                     </p>
                 </div>
 
@@ -257,19 +272,18 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
                             Block #{hoveredBlock.block_id}
                         </span>
                         <span
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                                hoveredBlock.is_free
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${hoveredBlock.is_free
                                     ? "bg-slate-800 text-slate-400"
                                     : hoveredBlock.is_prefix_cached
-                                    ? "bg-indigo-950 text-indigo-300 border border-indigo-700/50"
-                                    : "bg-emerald-950 text-emerald-300 border border-emerald-700/50"
-                            }`}
+                                        ? "bg-indigo-950 text-indigo-300 border border-indigo-700/50"
+                                        : "bg-emerald-950 text-emerald-300 border border-emerald-700/50"
+                                }`}
                         >
                             {hoveredBlock.is_free
                                 ? "Free Page"
                                 : hoveredBlock.is_prefix_cached
-                                ? "Prefix Shared"
-                                : "Active Page"}
+                                    ? "Prefix Shared"
+                                    : "Active Page"}
                         </span>
                     </div>
 
@@ -297,30 +311,26 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
             {/* Bottom Block Inspector HUD Bar */}
             <div className="mt-3 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
                 <div className="flex items-center gap-2">
-                    <Info className="w-3.5 h-3.5 text-slate-400" />
-                    <span>
+                    <Info className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                    <span className="truncate max-w-md">
                         {activeMeta
-                            ? `Selected Block #${activeMeta.block_id}: Ref Count = ${
-                                  activeMeta.ref_count
-                              }, Mapped = ${
-                                  activeMeta.mapped_seq_id !== null
-                                      ? `Sequence #${activeMeta.mapped_seq_id}`
-                                      : "None"
-                              }, Status = ${
-                                  activeMeta.is_free
-                                      ? "Free"
-                                      : activeMeta.is_prefix_cached
-                                      ? "Radix Cached"
-                                      : "Active"
-                              }`
+                            ? `Selected Block #${activeMeta.block_id}: Ref Count = ${activeMeta.ref_count
+                            }, Mapped = ${activeMeta.mapped_seq_id !== null
+                                ? `Sequence #${activeMeta.mapped_seq_id}`
+                                : "None"
+                            }, Status = ${activeMeta.is_free
+                                ? "Free"
+                                : activeMeta.is_prefix_cached
+                                    ? "Radix Cached"
+                                    : "Active"
+                            }`
                             : "Hover or click any block to inspect VRAM physical page allocation."}
                     </span>
                 </div>
 
-                <div className="flex items-center gap-3">
-                    <span className="font-mono text-emerald-400">
-                        {allocatedBlocks} / {totalBlocks} Blocks Active (
-                        {((allocatedBlocks / Math.max(1, totalBlocks)) * 100).toFixed(1)}%)
+                <div className="flex items-center gap-3 shrink-0">
+                    <span className="font-mono text-emerald-400 font-semibold">
+                        {safeAllocated} / {safeTotal} Blocks Active ({activePercent}%)
                     </span>
                 </div>
             </div>
