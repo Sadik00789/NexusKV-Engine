@@ -348,3 +348,5 @@ nexuskv-rust/
 
 ## 📄 License
 Licensed under the [MIT License](LICENSE).
+
+<img width="1920" height="1080" alt="Screenshot 2026-08-14 132320" src="https://github.com/user-attachments/assets/36f2a1f2-02d5-49c9-bd20-65ad551dd931" />
