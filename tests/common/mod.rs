@@ -35,6 +35,10 @@ impl SlowExecutor {
 }
 
 impl Executor for SlowExecutor {
+    fn prepare_sequence(&mut self, seq: SeqId, prompt: &[u32]) {
+        self.inner.prepare_sequence(seq, prompt);
+    }
+
     fn forward(
         &mut self,
         block_manager: &mut BlockSpaceManager,

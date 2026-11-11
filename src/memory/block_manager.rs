@@ -50,6 +50,9 @@ pub enum BlockState {
 pub struct BlockIoStats {
     pub swapped_out: u64,
     pub swapped_in: u64,
+    /// KV bytes moved device→host (or host→device) by the tier store.
+    pub swap_bytes_out: u64,
+    pub swap_bytes_in: u64,
     pub disk_spills: u64,
     pub disk_loads: u64,
 }
@@ -125,6 +128,15 @@ pub enum Res {
     Swapped,
 }
 
+/// Result of a prefix match. `hit_blocks` preserves the phase-1 bookkeeping
+/// count; `valid_tokens` is the leading prefix whose KV was already written by
+/// a successful forward pass and can therefore skip compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrefixMatch {
+    pub hit_blocks: usize,
+    pub valid_tokens: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrieNode {
     pub children: HashMap<Box<[u32]>, NodeId>,
@@ -132,6 +144,10 @@ pub struct TrieNode {
     pub parent: Option<NodeId>,
     pub key: Box<[u32]>,
     pub hash: u64,
+    /// True only after a forward pass has written this block's KV. Nodes are
+    /// created while allocating the page table, but an unwritten node is inert:
+    /// it can still be shared, yet it never lets a sequence skip prefill.
+    pub kv_valid: bool,
 }
 
 fn hash_chunk(parent_hash: u64, chunk: &[u32]) -> u64 {
@@ -304,6 +320,7 @@ impl BlockSpaceManager {
                 parent: None,
                 key: Box::new([]),
                 hash: 0,
+                kv_valid: false,
             }],
             node_of: vec![None; total_blocks],
             lru: BTreeMap::new(),
@@ -439,6 +456,9 @@ impl BlockSpaceManager {
             self.nodes[parent].children.remove(&key);
         }
         self.nodes[node].res = None;
+        // Detached nodes are unreachable; their KV content is no longer
+        // addressable, so they must never report a valid prefix.
+        self.nodes[node].kv_valid = false;
     }
 
     fn drop_cached_node(&mut self, block: BlockId, node: NodeId) {
@@ -567,6 +587,17 @@ impl BlockSpaceManager {
         seq: SeqId,
         prompt_tokens: &[u32],
     ) -> Result<usize, MemoryError> {
+        self.match_or_allocate_prefix_with_validity(seq, prompt_tokens)
+            .map(|matched| matched.hit_blocks)
+    }
+
+    /// Prefix match that also reports how many leading tokens already have
+    /// valid KV on a resident (or swapped-back-in) block.
+    pub fn match_or_allocate_prefix_with_validity(
+        &mut self,
+        seq: SeqId,
+        prompt_tokens: &[u32],
+    ) -> Result<PrefixMatch, MemoryError> {
         if self.page_tables.contains_key(&seq) {
             return Err(MemoryError::SequenceAlreadyRegistered(seq));
         }
@@ -580,6 +611,10 @@ impl BlockSpaceManager {
         let mut blocks: Vec<BlockId> = Vec::with_capacity(needed_blocks);
         let mut acquisitions: Vec<Acquisition> = Vec::new();
         let mut hits = 0usize;
+        let mut valid_tokens = 0usize;
+        // Validity must form a prefix: once an unwritten block is encountered,
+        // later valid blocks cannot be skipped because compute is contiguous.
+        let mut valid_chain = true;
         let mut chain_node = 0usize;
 
         macro_rules! fail {
@@ -604,6 +639,13 @@ impl BlockSpaceManager {
                         blocks.push(block);
                         acquisitions.push(Acquisition::Existing(block));
                         hits += 1;
+                        if valid_chain {
+                            if self.nodes[node].kv_valid {
+                                valid_tokens += self.block_size;
+                            } else {
+                                valid_chain = false;
+                            }
+                        }
                         self.emit(MemEventKind::Hit, Some(seq), vec![block]);
                         chain_node = node;
                         continue;
@@ -630,6 +672,13 @@ impl BlockSpaceManager {
                         acquisitions.push(Acquisition::Loaded { block, node });
                         self.stats.page_faults += 1;
                         hits += 1;
+                        if valid_chain {
+                            if self.nodes[node].kv_valid {
+                                valid_tokens += self.block_size;
+                            } else {
+                                valid_chain = false;
+                            }
+                        }
                         self.emit(MemEventKind::Fault, Some(seq), vec![block]);
                         chain_node = node;
                         continue;
@@ -655,6 +704,7 @@ impl BlockSpaceManager {
                 parent: Some(parent),
                 key: Box::from(chunk),
                 hash,
+                kv_valid: false,
             });
             self.nodes[parent].children.insert(Box::from(chunk), node);
             self.node_of[block] = Some(node);
@@ -684,7 +734,62 @@ impl BlockSpaceManager {
             },
         );
         self.stats.hits += hits as u64;
-        Ok(hits)
+        Ok(PrefixMatch {
+            hit_blocks: hits,
+            valid_tokens,
+        })
+    }
+
+    /// Mark every full prompt block whose last token is covered by a successful
+    /// forward ending at `start + len` as KV-valid. Returns the newly valid
+    /// block count. Partial tails have no trie node and are never marked.
+    pub fn mark_kv_valid(&mut self, seq: SeqId, start: usize, len: usize) -> usize {
+        let (prompt_len, blocks) = match self.page_tables.get(&seq) {
+            Some(table) => (table.prompt_len, table.physical_block_ids.clone()),
+            None => return 0,
+        };
+        let end = start.saturating_add(len);
+        let prompt_blocks = prompt_len / self.block_size;
+        let mut newly_valid = 0usize;
+        for (block_index, &block) in blocks
+            .iter()
+            .enumerate()
+            .take(prompt_blocks.min(blocks.len()))
+        {
+            let block_end = (block_index + 1) * self.block_size;
+            if block_end > end {
+                break;
+            }
+            if let Some(node) = self.node_of[block]
+                && !self.nodes[node].kv_valid
+                && matches!(self.nodes[node].res, Some(Res::Gpu(resident)) if resident == block)
+            {
+                self.nodes[node].kv_valid = true;
+                newly_valid += 1;
+            }
+        }
+        newly_valid
+    }
+
+    /// Leading full blocks whose KV is valid. Used by checkout so a commit taken
+    /// mid-prefill cannot claim unwritten KV.
+    pub fn valid_prefix_tokens(&self, seq: SeqId) -> usize {
+        let Some(table) = self.page_tables.get(&seq) else {
+            return 0;
+        };
+        let prompt_blocks = table.prompt_len / self.block_size;
+        let mut valid_blocks = 0usize;
+        for block_index in 0..prompt_blocks.min(table.physical_block_ids.len()) {
+            let block = table.physical_block_ids[block_index];
+            let Some(node) = self.node_of[block] else {
+                break;
+            };
+            if !self.nodes[node].kv_valid {
+                break;
+            }
+            valid_blocks += 1;
+        }
+        valid_blocks * self.block_size
     }
 
     // ------------------------------------------------------------------
@@ -1267,6 +1372,12 @@ impl BlockSpaceManager {
         }
 
         for node in 1..self.nodes.len() {
+            if self.nodes[node].kv_valid {
+                assert!(
+                    self.nodes[node].res.is_some(),
+                    "valid trie node {node} has no resource"
+                );
+            }
             match self.nodes[node].res {
                 Some(Res::Gpu(block)) => {
                     assert_eq!(self.node_of[block], Some(node));

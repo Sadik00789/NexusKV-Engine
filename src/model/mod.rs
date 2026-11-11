@@ -27,6 +27,11 @@ pub trait Executor: Send {
         all_logits: bool,
     ) -> Result<Vec<Vec<f32>>, ModelError>;
 
+    /// Called once when a sequence is admitted. Executors that derive state
+    /// from the prompt (the mock's deterministic offset) use the full prompt
+    /// here, so KV-valid prefix skipping cannot change the continuation rule.
+    fn prepare_sequence(&mut self, _seq: SeqId, _prompt: &[u32]) {}
+
     /// Copy one physical KV block. Called when the allocator reports CoW.
     fn copy_block(&mut self, _src: usize, _dst: usize) -> Result<(), ModelError> {
         Ok(())
@@ -37,6 +42,11 @@ pub trait Executor: Send {
     fn is_mock(&self) -> bool;
 
     fn name(&self) -> &'static str;
+
+    /// Honest attention implementation label for telemetry.
+    fn attention_backend(&self) -> &'static str {
+        "gather"
+    }
 }
 
 /// Tokenization and detokenization shared by the HTTP layer and the actor.
@@ -110,6 +120,14 @@ impl MockExecutor {
         }
     }
 
+    fn prompt_offset(prompt: &[u32]) -> u32 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &token in prompt {
+            hash = (hash ^ u64::from(token)).wrapping_mul(0x1000_0000_01b3);
+        }
+        (hash as u32) % 256
+    }
+
     fn predict(&self, seq: SeqId, previous: u32, last: u32) -> u32 {
         let offset = self.offsets.get(&seq).copied().unwrap_or(0);
         last.wrapping_mul(3)
@@ -147,6 +165,16 @@ impl Default for MockExecutor {
 }
 
 impl Executor for MockExecutor {
+    fn prepare_sequence(&mut self, seq: SeqId, prompt: &[u32]) {
+        self.offsets
+            .entry(seq)
+            .or_insert_with(|| Self::prompt_offset(prompt));
+        // Seed the history for prompt positions that a KV-valid hit may skip.
+        // Decode reads position-1, so an unseeded history would change the
+        // deterministic continuation even though the KV bytes are correct.
+        self.history.insert(seq, prompt.to_vec());
+    }
+
     fn forward(
         &mut self,
         _block_manager: &mut BlockSpaceManager,
@@ -161,6 +189,8 @@ impl Executor for MockExecutor {
             ));
         }
         if !self.offsets.contains_key(&seq) {
+            // Direct executor users (unit tests) may call forward without
+            // prepare_sequence; fall back to the first chunk as before.
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             for &token in tokens {
                 hash = (hash ^ u64::from(token)).wrapping_mul(0x1000_0000_01b3);
@@ -205,6 +235,10 @@ impl Executor for MockExecutor {
     }
 
     fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn attention_backend(&self) -> &'static str {
         "mock"
     }
 }

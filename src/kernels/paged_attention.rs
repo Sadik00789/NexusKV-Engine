@@ -8,11 +8,13 @@
 //! no nvcc or GPU dependency.
 
 #[cfg(feature = "cuda")]
+use half::f16;
+#[cfg(feature = "cuda")]
 use std::ffi::c_void;
 #[cfg(feature = "cuda")]
 use std::mem::size_of_val;
 #[cfg(feature = "cuda")]
-use std::os::raw::{c_float, c_int};
+use std::os::raw::c_int;
 
 #[cfg(feature = "cuda")]
 mod ffi {
@@ -37,6 +39,25 @@ mod ffi {
             head_dim: c_int,
             block_size: c_int,
             scale: c_float,
+        ) -> c_int;
+
+        /// Half-precision variant. `out`, `q`, `k_cache`, and `v_cache` are
+        /// `__half*`; `stream` is a CUDA stream handle (null for default).
+        pub fn launch_paged_attention_f16(
+            out: *mut c_void,
+            q: *const c_void,
+            k_cache: *const c_void,
+            v_cache: *const c_void,
+            block_tables: *const c_int,
+            seq_lens: *const c_int,
+            max_blocks_per_seq: c_int,
+            num_seqs: c_int,
+            num_heads: c_int,
+            num_kv_heads: c_int,
+            head_dim: c_int,
+            block_size: c_int,
+            scale: c_float,
+            stream: *mut c_void,
         ) -> c_int;
 
         pub fn launch_reshape_and_cache(
@@ -245,6 +266,142 @@ pub fn run_paged_attention(
     Err("NexusKV was built without the `cuda` feature".to_string())
 }
 
+/// Safe f16 CUDA entry point used by parity tests. Inputs and outputs are f32
+/// host slices; the buffer is converted to half on the device.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub fn run_paged_attention_f16(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    block_tables: &[i32],
+    seq_lens: &[i32],
+    max_blocks_per_seq: usize,
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+) -> Result<(), String> {
+    if head_dim == 0
+        || num_kv_heads == 0
+        || num_heads == 0
+        || !num_heads.is_multiple_of(num_kv_heads)
+    {
+        return Err("num_heads must be a positive multiple of num_kv_heads".to_string());
+    }
+    let expected = num_seqs
+        .checked_mul(num_heads)
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| "attention size overflow".to_string())?;
+    if out.len() < expected || q.len() < expected {
+        return Err("out/q buffers are smaller than num_seqs*num_heads*head_dim".to_string());
+    }
+    if seq_lens.len() < num_seqs {
+        return Err("seq_lens is smaller than num_seqs".to_string());
+    }
+    if block_tables.len() < num_seqs * max_blocks_per_seq {
+        return Err("block_tables is smaller than num_seqs*max_blocks_per_seq".to_string());
+    }
+    let to_half =
+        |values: &[f32]| -> Vec<f16> { values.iter().map(|&value| f16::from_f32(value)).collect() };
+    let q_half = to_half(&q[..expected]);
+    let k_half = to_half(k_cache);
+    let v_half = to_half(v_cache);
+    let out_buffer = DeviceBuffer::new(expected * std::mem::size_of::<f16>())?;
+    let q_buffer = DeviceBuffer::from_slice(&q_half)?;
+    let k_buffer = DeviceBuffer::from_slice(&k_half)?;
+    let v_buffer = DeviceBuffer::from_slice(&v_half)?;
+    let table_buffer = DeviceBuffer::from_slice(block_tables)?;
+    let lens_buffer = DeviceBuffer::from_slice(seq_lens)?;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // SAFETY: every device pointer is a live allocation of the size copied in
+    // above; the kernel reads q/k/v/tables/lens and writes exactly `expected`
+    // half elements. A null stream means the default stream, and the safe
+    // wrapper copies results back synchronously.
+    let code = unsafe {
+        ffi::launch_paged_attention_f16(
+            out_buffer.as_mut_ptr::<f16>() as *mut c_void,
+            q_buffer.as_ptr::<f16>() as *const c_void,
+            k_buffer.as_ptr::<f16>() as *const c_void,
+            v_buffer.as_ptr::<f16>() as *const c_void,
+            table_buffer.as_ptr::<i32>(),
+            lens_buffer.as_ptr::<i32>(),
+            max_blocks_per_seq as c_int,
+            num_seqs as c_int,
+            num_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            block_size as c_int,
+            scale,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(format!("CUDA f16 paged attention failed with code {code}"));
+    }
+    let mut half_out = vec![f16::ZERO; expected];
+    out_buffer.copy_out(&mut half_out)?;
+    for (destination, value) in out[..expected].iter_mut().zip(half_out) {
+        *destination = value.to_f32();
+    }
+    Ok(())
+}
+
+/// Raw device-pointer entry point for the live candle decode path.
+///
+/// # Safety
+/// `out`, `q`, `k_cache`, and `v_cache` must be live `__half` device buffers of
+/// the sizes implied by the dimensions; `block_tables`/`seq_lens` must be live
+/// device `i32` buffers; `stream` must be a valid CUDA stream from the same
+/// context. The caller (candle executor) upholds these by holding the tensor
+/// storage alive through the launch.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_paged_attention_f16_device(
+    out: *mut c_void,
+    q: *const c_void,
+    k_cache: *const c_void,
+    v_cache: *const c_void,
+    block_tables: *const i32,
+    seq_lens: *const i32,
+    max_blocks_per_seq: usize,
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller guarantees every pointer is valid for the dimensions
+    // and remains alive until the stream-ordered launch completes.
+    let code = unsafe {
+        ffi::launch_paged_attention_f16(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens,
+            max_blocks_per_seq as c_int,
+            num_seqs as c_int,
+            num_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            block_size as c_int,
+            scale,
+            stream,
+        )
+    };
+    if code != 0 {
+        return Err(format!("CUDA f16 paged attention failed with code {code}"));
+    }
+    Ok(())
+}
+
 /// Write key/value rows into the flat slot-indexed KV pool (CUDA feature only).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
@@ -354,6 +511,45 @@ pub fn run_paged_attention_cpu_ref(
     head_dim: usize,
     block_size: usize,
 ) {
+    run_paged_attention_cpu_ref_gqa(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        max_blocks_per_seq,
+        num_seqs,
+        num_heads,
+        num_heads,
+        head_dim,
+        block_size,
+    );
+}
+
+/// GQA-aware CPU reference. Query head `h` reads KV head
+/// `h / (num_heads / num_kv_heads)`, matching the CUDA kernel and candle's
+/// consecutive `repeat_kv` layout.
+#[allow(clippy::too_many_arguments)]
+pub fn run_paged_attention_cpu_ref_gqa(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    block_tables: &[i32],
+    seq_lens: &[i32],
+    max_blocks_per_seq: usize,
+    num_seqs: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+) {
+    assert!(
+        num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads),
+        "num_heads must be a positive multiple of num_kv_heads"
+    );
+    let n_rep = num_heads / num_kv_heads;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     for seq in 0..num_seqs {
         let seq_len = seq_lens[seq].max(0) as usize;
@@ -361,12 +557,13 @@ pub fn run_paged_attention_cpu_ref(
             continue;
         }
         for head in 0..num_heads {
+            let kv_head = head / n_rep;
             let mut scores = vec![0f32; seq_len];
             let mut max_score = f32::NEG_INFINITY;
             for (token, score) in scores.iter_mut().enumerate() {
                 let block = block_tables[seq * max_blocks_per_seq + token / block_size] as usize;
                 let offset = token % block_size;
-                let kv_offset = ((block * block_size + offset) * num_heads + head) * head_dim;
+                let kv_offset = ((block * block_size + offset) * num_kv_heads + kv_head) * head_dim;
                 let mut dot = 0.0f32;
                 for dim in 0..head_dim {
                     let q_offset = (seq * num_heads + head) * head_dim + dim;
@@ -391,7 +588,8 @@ pub fn run_paged_attention_cpu_ref(
                     let block =
                         block_tables[seq * max_blocks_per_seq + token / block_size] as usize;
                     let offset = token % block_size;
-                    let kv_offset = ((block * block_size + offset) * num_heads + head) * head_dim;
+                    let kv_offset =
+                        ((block * block_size + offset) * num_kv_heads + kv_head) * head_dim;
                     accumulator += (probability / denominator) * v_cache[kv_offset + dim];
                 }
                 out[(seq * num_heads + head) * head_dim + dim] = accumulator;
@@ -559,6 +757,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cpu_reference_gqa_maps_sixteen_query_heads_to_eight_kv_heads() {
+        let num_heads = 16usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 2usize;
+        let block_size = 2usize;
+        let seq_len = 2usize;
+        let max_blocks = 1usize;
+        // Equal scores (q and k are zero) => uniform attention over the two
+        // tokens. Each KV head has a distinct value so a wrong mapping is
+        // visible in the output.
+        let q = vec![0f32; num_heads * head_dim];
+        let k = vec![0f32; block_size * num_kv_heads * head_dim];
+        let mut v = vec![0f32; block_size * num_kv_heads * head_dim];
+        for kv_head in 0..num_kv_heads {
+            for token in 0..block_size {
+                for dim in 0..head_dim {
+                    v[(token * num_kv_heads + kv_head) * head_dim + dim] =
+                        kv_head as f32 * 10.0 + dim as f32 + token as f32 * 0.5;
+                }
+            }
+        }
+        let mut out = vec![0f32; num_heads * head_dim];
+        run_paged_attention_cpu_ref_gqa(
+            &mut out,
+            &q,
+            &k,
+            &v,
+            &[0],
+            &[seq_len as i32],
+            max_blocks,
+            1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+        );
+        let n_rep = num_heads / num_kv_heads;
+        for head in 0..num_heads {
+            let kv_head = head / n_rep;
+            for dim in 0..head_dim {
+                let expected = kv_head as f32 * 10.0 + dim as f32 + 0.25;
+                let actual = out[head * head_dim + dim];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "head {head} dim {dim}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
     // GPU-only tests. They require an NVIDIA GPU, a driver, nvcc, and
     // `cargo test --features cuda -- --ignored`.
     #[cfg(feature = "cuda")]
@@ -618,6 +867,73 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_error < 1e-3, "CUDA attention max error {max_error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and a build with --features cuda"]
+    fn cuda_f16_gqa_attention_parity_with_cpu_reference() {
+        let mut rng = Lcg::new(2026);
+        let head_dim = 64usize;
+        let num_heads = 16usize;
+        let num_kv_heads = 8usize;
+        let seq_len = 137usize;
+        let block_size = 16usize;
+        let max_blocks = seq_len.div_ceil(block_size);
+        let num_blocks = max_blocks + 2;
+        let q: Vec<f32> = (0..num_heads * head_dim)
+            .map(|_| rng.next_f32(-1.0, 1.0))
+            .collect();
+        let k: Vec<f32> = (0..num_blocks * block_size * num_kv_heads * head_dim)
+            .map(|_| rng.next_f32(-1.0, 1.0))
+            .collect();
+        let v: Vec<f32> = (0..num_blocks * block_size * num_kv_heads * head_dim)
+            .map(|_| rng.next_f32(-1.0, 1.0))
+            .collect();
+        let block_tables: Vec<i32> = (0..max_blocks).map(|index| index as i32).collect();
+        let mut expected = vec![0f32; num_heads * head_dim];
+        run_paged_attention_cpu_ref_gqa(
+            &mut expected,
+            &q,
+            &k,
+            &v,
+            &block_tables,
+            &[seq_len as i32],
+            max_blocks,
+            1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+        );
+        let mut actual = vec![0f32; num_heads * head_dim];
+        run_paged_attention_f16(
+            &mut actual,
+            &q,
+            &k,
+            &v,
+            &block_tables,
+            &[seq_len as i32],
+            max_blocks,
+            1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+        )
+        .expect("CUDA f16 attention");
+        let mut worst = 0f32;
+        for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            let relative = (a - b).abs() / b.abs().max(1e-3);
+            if relative > worst {
+                worst = relative;
+            }
+            assert!(
+                relative < 2e-2,
+                "f16 GQA output {index}: actual={a} expected={b} relative={relative}"
+            );
+        }
+        assert!(worst < 2e-2, "worst relative error {worst}");
     }
 
     #[cfg(feature = "cuda")]

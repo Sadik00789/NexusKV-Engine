@@ -23,6 +23,44 @@ jobs:
       - name: Tests (default features, no GPU)
         run: cargo test
 
+  windows:
+    # Hosted Windows runners have no NVIDIA GPU and no CUDA toolkit. This job
+    # proves the default feature set (no GPU needed) and the dashboard build.
+    # Never enable the `cuda` feature here; GPU parity runs self-hosted via
+    # scripts/test_gpu.ps1.
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Environment checker self-test
+        shell: powershell
+        run: ./scripts/check_env.ps1 -SelfTest
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (default features, no GPU)
+        run: cargo test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable pnpm
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.18.0 --activate
+      - name: Dashboard install
+        working-directory: dashboard
+        run: pnpm install --frozen-lockfile
+      - name: Dashboard build
+        working-directory: dashboard
+        run: pnpm build
+
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -54,5 +92,5 @@ jobs:
   #   steps:
   #     - uses: actions/checkout@v4
   #     - uses: dtolnay/rust-toolchain@stable
-  #     - run: cargo test --features cuda -- --ignored
-  #     - run: bash scripts/sanitize.sh
+  #     - shell: powershell
+  #       run: ./scripts/test_gpu.ps1

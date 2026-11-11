@@ -52,6 +52,16 @@ pnpm-debug.log*
 .commandcode/
 DECISIONS.md
 
+# Model weights are downloaded locally, never committed.
+/models/
+
+# Measured benchmark JSON is written locally for evidence; never auto-committed.
+/benches/results/
+
+# Python bytecode from helper scripts.
+__pycache__/
+*.pyc
+
 # -----------------------------------------------------------------------------
 # Operating System & IDE Artifacts
 # -----------------------------------------------------------------------------

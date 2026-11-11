@@ -1,10 +1,15 @@
 // src/model/qwen.rs
 use super::{Executor, ModelError, Tokenizer};
 use crate::config::EngineConfig;
-use crate::memory::tier::GpuBridge;
+use crate::memory::tier::{GpuBridge, KvDType};
 use crate::memory::{BlockId, BlockSpaceManager, SeqId};
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{D, DType, Device, Module, Result as CandleResult, Tensor};
 use candle_nn::{Embedding, Linear, VarBuilder as NnVarBuilder, embedding};
+use half::f16;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -169,6 +174,41 @@ fn select_device() -> Device {
     }
 }
 
+/// `NEXUSKV_DTYPE=f32` opts out of the f16 CUDA default. CPU builds always use
+/// f32; the f32 CUDA fallback also clamps the pool (see `EngineConfig`).
+pub fn cuda_f32_requested() -> bool {
+    std::env::var("NEXUSKV_DTYPE")
+        .map(|value| value.eq_ignore_ascii_case("f32"))
+        .unwrap_or(false)
+}
+
+fn model_dtype(device: &Device) -> DType {
+    if device.is_cuda() && !cuda_f32_requested() {
+        DType::F16
+    } else {
+        DType::F32
+    }
+}
+
+/// Log measured VRAM from nvidia-smi. Never fatal: a missing tool only means the
+/// startup report has no VRAM row.
+fn log_vram(stage: &str) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let text = text.trim().replace('\n', "; ");
+            tracing::info!("VRAM {stage}: {text}");
+        }
+        _ => tracing::debug!("nvidia-smi unavailable; VRAM not measured at {stage}"),
+    }
+}
+
 fn load_linear(vb: NnVarBuilder<'_>, in_dim: usize, out_dim: usize) -> anyhow::Result<Linear> {
     let weight = vb.get((out_dim, in_dim), "weight")?;
     let bias = vb.get(out_dim, "bias").ok();
@@ -278,14 +318,19 @@ fn apply_rope(
     start: usize,
     seq_len: usize,
 ) -> CandleResult<Tensor> {
+    let dtype = x.dtype();
     let head_dim = x.dim(D::Minus1)?;
     let half = head_dim / 2;
     let cos = cos.narrow(0, start, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
     let sin = sin.narrow(0, start, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
+    // RoPE accumulates in f32 even when the weights and KV pools are f16.
+    let x = x.to_dtype(DType::F32)?;
     let first = x.narrow(D::Minus1, 0, half)?;
     let second = x.narrow(D::Minus1, half, half)?;
     let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
-    x.broadcast_mul(&cos)?.add(&rotated.broadcast_mul(&sin)?)
+    x.broadcast_mul(&cos)?
+        .add(&rotated.broadcast_mul(&sin)?)?
+        .to_dtype(dtype)
 }
 
 fn causal_mask(start: usize, q_len: usize, k_len: usize, device: &Device) -> CandleResult<Tensor> {
@@ -319,12 +364,196 @@ fn gather_attention(
         .unsqueeze(0)?;
     let k = repeat_kv(k, n_rep)?;
     let v = repeat_kv(v, n_rep)?;
+    let value_dtype = v.dtype();
     let head_dim = q.dim(D::Minus1)?;
     let scale = 1.0 / (head_dim as f64).sqrt();
     let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
-    let scores = scores.broadcast_add(mask)?;
+    // Softmax and the probability × value accumulation both run in f32 for f16
+    // pools; only the final attention output is narrowed back.
+    let scores = scores.to_dtype(DType::F32)?;
+    let scores = scores.broadcast_add(&mask.to_dtype(DType::F32)?)?;
     let probabilities = candle_nn::ops::softmax_last_dim(&scores)?;
-    probabilities.matmul(&v)
+    // Keep the probability × value accumulation in f32 as well; this matches
+    // the custom kernel's accumulation and avoids a second f16 rounding before
+    // o_proj. The result is narrowed back to the model dtype.
+    probabilities
+        .matmul(&v.to_dtype(DType::F32)?)?
+        .to_dtype(value_dtype)
+}
+
+/// Per-forward state shared by every layer when the custom f16 decode kernel is
+/// active. The block table and sequence length live once on the device, not
+/// once per layer.
+#[cfg(feature = "cuda")]
+struct CudaDecodeContext {
+    block_tables: Tensor,
+    seq_lens: Tensor,
+    max_blocks_per_seq: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaDecodeContext {
+    fn new(
+        block_manager: &BlockSpaceManager,
+        seq: SeqId,
+        device: &Device,
+        config: &Qwen2Config,
+    ) -> Result<Self, String> {
+        let (tables, lens) = block_manager.export_block_tables(&[seq]);
+        let max_blocks_per_seq = block_manager.max_blocks_per_seq;
+        let block_tables = Tensor::from_vec(tables, (max_blocks_per_seq,), device)
+            .map_err(|error| format!("cannot upload block table: {error}"))?;
+        let seq_lens = Tensor::from_vec(lens, (1,), device)
+            .map_err(|error| format!("cannot upload seq lens: {error}"))?;
+        Ok(Self {
+            block_tables,
+            seq_lens,
+            max_blocks_per_seq,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            block_size: block_manager.block_size,
+        })
+    }
+
+    fn attention(
+        &self,
+        q: &Tensor,
+        k_pool: &Tensor,
+        v_pool: &Tensor,
+        device: &Device,
+    ) -> Result<Tensor, String> {
+        if q.dtype() != DType::F16 || k_pool.dtype() != DType::F16 || v_pool.dtype() != DType::F16 {
+            return Err("custom CUDA attention requires f16 q and f16 KV pools".to_string());
+        }
+        if !k_pool.layout().is_contiguous() || !v_pool.layout().is_contiguous() {
+            return Err("KV pools are not contiguous".to_string());
+        }
+        let q = q
+            .contiguous()
+            .map_err(|error| format!("cannot make q contiguous: {error}"))?;
+        if !q.layout().is_contiguous() {
+            return Err("q is not contiguous after copy".to_string());
+        }
+        let cuda_device = match device {
+            Device::Cuda(cuda) => cuda,
+            _ => return Err("device is not CUDA".to_string()),
+        };
+        let stream = cuda_device.cuda_stream();
+        let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+        let out = Tensor::zeros((1, self.num_heads, 1, self.head_dim), DType::F16, device)
+            .map_err(|error| format!("cannot allocate attention output: {error}"))?;
+
+        let (q_storage, q_layout) = q.storage_and_layout();
+        let q_cuda = match &*q_storage {
+            Storage::Cuda(storage) => storage,
+            _ => return Err("q storage is not CUDA".to_string()),
+        };
+        let q_slice = q_cuda
+            .as_cuda_slice::<f16>()
+            .map_err(|error| format!("q is not an f16 CUDA slice: {error}"))?;
+        let (q_base, _q_guard) = q_slice.device_ptr(&stream);
+        let q_pointer = (q_base + (q_layout.start_offset() * 2) as u64) as *const std::ffi::c_void;
+
+        let (k_storage, k_layout) = k_pool.storage_and_layout();
+        let k_cuda = match &*k_storage {
+            Storage::Cuda(storage) => storage,
+            _ => return Err("K pool storage is not CUDA".to_string()),
+        };
+        let k_slice = k_cuda
+            .as_cuda_slice::<f16>()
+            .map_err(|error| format!("K pool is not an f16 CUDA slice: {error}"))?;
+        let (k_base, _k_guard) = k_slice.device_ptr(&stream);
+        let k_pointer = (k_base + (k_layout.start_offset() * 2) as u64) as *const std::ffi::c_void;
+
+        let (v_storage, v_layout) = v_pool.storage_and_layout();
+        let v_cuda = match &*v_storage {
+            Storage::Cuda(storage) => storage,
+            _ => return Err("V pool storage is not CUDA".to_string()),
+        };
+        let v_slice = v_cuda
+            .as_cuda_slice::<f16>()
+            .map_err(|error| format!("V pool is not an f16 CUDA slice: {error}"))?;
+        let (v_base, _v_guard) = v_slice.device_ptr(&stream);
+        let v_pointer = (v_base + (v_layout.start_offset() * 2) as u64) as *const std::ffi::c_void;
+
+        let (tables_storage, tables_layout) = self.block_tables.storage_and_layout();
+        let tables_cuda = match &*tables_storage {
+            Storage::Cuda(storage) => storage,
+            _ => return Err("block table storage is not CUDA".to_string()),
+        };
+        let tables_slice = tables_cuda
+            .as_cuda_slice::<i32>()
+            .map_err(|error| format!("block table is not i32: {error}"))?;
+        let (tables_base, _tables_guard) = tables_slice.device_ptr(&stream);
+        let tables_pointer =
+            (tables_base + (tables_layout.start_offset() * 4) as u64) as *const i32;
+
+        let (lens_storage, lens_layout) = self.seq_lens.storage_and_layout();
+        let lens_cuda = match &*lens_storage {
+            Storage::Cuda(storage) => storage,
+            _ => return Err("seq lens storage is not CUDA".to_string()),
+        };
+        let lens_slice = lens_cuda
+            .as_cuda_slice::<i32>()
+            .map_err(|error| format!("seq lens is not i32: {error}"))?;
+        let (lens_base, _lens_guard) = lens_slice.device_ptr(&stream);
+        let lens_pointer = (lens_base + (lens_layout.start_offset() * 4) as u64) as *const i32;
+
+        let out_pointer = {
+            let (out_storage, out_layout) = out.storage_and_layout();
+            let out_cuda = match &*out_storage {
+                Storage::Cuda(storage) => storage,
+                _ => return Err("attention output storage is not CUDA".to_string()),
+            };
+            let out_slice = out_cuda
+                .as_cuda_slice::<f16>()
+                .map_err(|error| format!("output is not an f16 CUDA slice: {error}"))?;
+            let (out_base, out_guard) = out_slice.device_ptr(&stream);
+            let pointer =
+                (out_base + (out_layout.start_offset() * 2) as u64) as *mut std::ffi::c_void;
+            // Record the stream dependency before releasing the storage guard;
+            // the tensor itself stays alive until the caller consumes it.
+            drop(out_guard);
+            pointer
+        };
+
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        // SAFETY: every pointer comes from a live candle CUDA tensor held for
+        // the duration of this call; the launch is on candle's own stream, so
+        // it is ordered after q/KV production and before the output is read.
+        unsafe {
+            crate::kernels::launch_paged_attention_f16_device(
+                out_pointer,
+                q_pointer,
+                k_pointer,
+                v_pointer,
+                tables_pointer,
+                lens_pointer,
+                self.max_blocks_per_seq,
+                1,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+                scale,
+                raw_stream,
+            )?;
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn warn_cuda_attention_fallback(error: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!("custom CUDA decode attention unavailable; using gather attention: {error}")
+    });
 }
 
 fn write_kv_block(
@@ -372,6 +601,9 @@ pub struct Qwen2Model {
     sin: Tensor,
     pools: Arc<Mutex<QwenKvPools>>,
     block_size: usize,
+    /// `NEXUSKV_CUDA_ATTENTION=1` on a CUDA f16 model: decode uses the custom
+    /// paged kernel, with automatic fallback to gather attention.
+    cuda_attention: bool,
 }
 
 impl Qwen2Model {
@@ -429,12 +661,28 @@ impl Qwen2Model {
             &device,
         )?;
 
+        // KV pools follow the weight dtype: f16 on CUDA by default, f32 on CPU.
+        // The pools are the largest per-token allocation, so this is what makes
+        // 192 blocks fit in 4 GB.
+        let pool_dtype = vb.dtype();
         let kv_shape = (total_slots, config.num_kv_heads, config.head_dim);
         let mut k_pools = Vec::with_capacity(config.num_layers);
         let mut v_pools = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            k_pools.push(Tensor::zeros(kv_shape, DType::F32, &device)?);
-            v_pools.push(Tensor::zeros(kv_shape, DType::F32, &device)?);
+            k_pools.push(Tensor::zeros(kv_shape, pool_dtype, &device)?);
+            v_pools.push(Tensor::zeros(kv_shape, pool_dtype, &device)?);
+        }
+
+        let cuda_attention = device.is_cuda()
+            && pool_dtype == DType::F16
+            && std::env::var("NEXUSKV_CUDA_ATTENTION")
+                .map(|value| value == "1")
+                .unwrap_or(false);
+        if cuda_attention {
+            tracing::info!(
+                "Custom CUDA f16 decode attention enabled (NEXUSKV_CUDA_ATTENTION=1); \
+                 prefill keeps gather attention"
+            );
         }
 
         Ok(Self {
@@ -452,6 +700,7 @@ impl Qwen2Model {
                 v: v_pools,
             })),
             block_size,
+            cuda_attention,
         })
     }
 
@@ -462,6 +711,25 @@ impl Qwen2Model {
         tokens: &[u32],
         start: usize,
         all_logits: bool,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.forward_inner(
+            block_manager,
+            seq,
+            tokens,
+            start,
+            all_logits,
+            self.cuda_attention,
+        )
+    }
+
+    fn forward_inner(
+        &mut self,
+        block_manager: &mut BlockSpaceManager,
+        seq: SeqId,
+        tokens: &[u32],
+        start: usize,
+        all_logits: bool,
+        use_cuda_kernel: bool,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         if tokens.is_empty() {
             return Err(ModelError::Invalid(
@@ -497,6 +765,20 @@ impl Qwen2Model {
         let slot_tensor =
             Tensor::from_vec(slot_indices, (total_len,), device).map_err(candle_error)?;
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
+        #[cfg(feature = "cuda")]
+        let cuda_context = if use_cuda_kernel && seq_len == 1 {
+            match CudaDecodeContext::new(block_manager, seq, device, &self.config) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    warn_cuda_attention_fallback(&error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _ = use_cuda_kernel;
         let pools = Arc::clone(&self.pools);
         let pools = pools
             .lock()
@@ -543,15 +825,49 @@ impl Qwen2Model {
                 write_kv_block(&pools.k[layer_index], &pools.v[layer_index], &k, &v, &slots)
                     .map_err(candle_error)?;
 
-                let attention = gather_attention(
-                    &q,
-                    &pools.k[layer_index],
-                    &pools.v[layer_index],
-                    &slot_tensor,
-                    &mask,
-                    n_rep,
-                )
-                .map_err(candle_error)?;
+                let attention = {
+                    #[cfg(feature = "cuda")]
+                    {
+                        let custom = cuda_context.as_ref().and_then(|context| {
+                            match context.attention(
+                                &q,
+                                &pools.k[layer_index],
+                                &pools.v[layer_index],
+                                device,
+                            ) {
+                                Ok(attention) => Some(attention),
+                                Err(error) => {
+                                    warn_cuda_attention_fallback(&error);
+                                    None
+                                }
+                            }
+                        });
+                        match custom {
+                            Some(attention) => attention,
+                            None => gather_attention(
+                                &q,
+                                &pools.k[layer_index],
+                                &pools.v[layer_index],
+                                &slot_tensor,
+                                &mask,
+                                n_rep,
+                            )
+                            .map_err(candle_error)?,
+                        }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        gather_attention(
+                            &q,
+                            &pools.k[layer_index],
+                            &pools.v[layer_index],
+                            &slot_tensor,
+                            &mask,
+                            n_rep,
+                        )
+                        .map_err(candle_error)?
+                    }
+                };
                 let attention = attention
                     .transpose(1, 2)
                     .and_then(|tensor| tensor.reshape((1, seq_len, self.config.attention_width())))
@@ -603,6 +919,8 @@ impl Qwen2Model {
         };
         let flat = logits
             .flatten_all()
+            // Logits may be f16 on the CUDA path; sampling consumes f32.
+            .and_then(|tensor| tensor.to_dtype(DType::F32))
             .and_then(|tensor| tensor.to_vec1::<f32>())
             .map_err(candle_error)?;
         let vocabulary = self.config.vocab_size.max(1);
@@ -651,22 +969,30 @@ impl Qwen2Model {
     }
 
     fn gpu_bridge(&self) -> QwenGpuBridge {
+        let pools = Arc::clone(&self.pools);
+        let dtype = pools
+            .lock()
+            .ok()
+            .and_then(|pools| pools.k.first().map(Tensor::dtype))
+            .unwrap_or(DType::F32);
         QwenGpuBridge {
-            pools: Arc::clone(&self.pools),
+            pools,
             device: self.device.clone(),
             block_size: self.block_size,
             kv_heads: self.config.num_kv_heads,
             head_dim: self.config.head_dim,
             num_layers: self.config.num_layers,
+            dtype,
         }
     }
 }
 
 /// Byte-level bridge from the candle paged KV pools to the tier store.
 ///
-/// v1 serializes each layer's K and V block as f32 bytes. A future optimization
-/// can copy device-to-host asynchronously and respect the pool dtype (f16/bf16)
-/// without changing the `GpuBridge` contract.
+/// The pool dtype determines the serialization: f16 pools are copied as raw
+/// half bytes, halving tier traffic and host memory versus the old f32
+/// container. The on-disk format records the dtype (NKV2) so a mismatch fails
+/// loudly instead of decoding garbage.
 #[derive(Clone)]
 pub struct QwenGpuBridge {
     pools: Arc<Mutex<QwenKvPools>>,
@@ -675,17 +1001,34 @@ pub struct QwenGpuBridge {
     kv_heads: usize,
     head_dim: usize,
     num_layers: usize,
+    dtype: DType,
 }
 
 impl QwenGpuBridge {
+    fn bytes_per_element(&self) -> usize {
+        self.dtype.size_in_bytes()
+    }
+
     fn expected_bytes(&self) -> usize {
-        self.num_layers * 2 * self.block_size * self.kv_heads * self.head_dim * 4
+        self.num_layers
+            * 2
+            * self.block_size
+            * self.kv_heads
+            * self.head_dim
+            * self.bytes_per_element()
     }
 }
 
 impl GpuBridge for QwenGpuBridge {
     fn block_bytes(&self) -> usize {
         self.expected_bytes()
+    }
+
+    fn dtype(&self) -> KvDType {
+        match self.dtype {
+            DType::F16 => KvDType::F16,
+            _ => KvDType::F32,
+        }
     }
 
     fn read_block(&mut self, block: BlockId) -> Result<Vec<u8>, String> {
@@ -701,10 +1044,27 @@ impl GpuBridge for QwenGpuBridge {
             let values = pool
                 .narrow(0, start, self.block_size)
                 .and_then(|tensor| tensor.flatten_all())
-                .and_then(|tensor| tensor.to_vec1::<f32>())
                 .map_err(|error| format!("cannot read KV block {block}: {error}"))?;
-            for value in values {
-                bytes.extend_from_slice(&value.to_le_bytes());
+            match self.dtype {
+                DType::F16 => {
+                    let values = values
+                        .to_vec1::<f16>()
+                        .map_err(|error| format!("cannot read f16 KV block {block}: {error}"))?;
+                    for value in values {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                DType::F32 => {
+                    let values = values
+                        .to_vec1::<f32>()
+                        .map_err(|error| format!("cannot read f32 KV block {block}: {error}"))?;
+                    for value in values {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                other => {
+                    return Err(format!("unsupported KV pool dtype {other:?}"));
+                }
             }
         }
         Ok(bytes)
@@ -722,7 +1082,7 @@ impl GpuBridge for QwenGpuBridge {
             .checked_mul(self.block_size)
             .ok_or_else(|| format!("block {block} offset overflow"))?;
         let values_per_pool = self.block_size * self.kv_heads * self.head_dim;
-        let bytes_per_pool = values_per_pool * 4;
+        let bytes_per_pool = values_per_pool * self.bytes_per_element();
         let pools = self
             .pools
             .lock()
@@ -733,17 +1093,35 @@ impl GpuBridge for QwenGpuBridge {
             .chain(pools.v.iter())
             .zip(bytes.chunks_exact(bytes_per_pool))
         {
-            let values: Vec<f32> = chunk
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| f32::from_le_bytes(*word))
-                .collect();
-            let tensor = Tensor::from_vec(
-                values,
-                (self.block_size, self.kv_heads, self.head_dim),
-                &self.device,
-            )
+            let tensor = match self.dtype {
+                DType::F16 => {
+                    let values: Vec<f16> = chunk
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|word| f16::from_le_bytes(*word))
+                        .collect();
+                    Tensor::from_vec(
+                        values,
+                        (self.block_size, self.kv_heads, self.head_dim),
+                        &self.device,
+                    )
+                }
+                DType::F32 => {
+                    let values: Vec<f32> = chunk
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| f32::from_le_bytes(*word))
+                        .collect();
+                    Tensor::from_vec(
+                        values,
+                        (self.block_size, self.kv_heads, self.head_dim),
+                        &self.device,
+                    )
+                }
+                other => return Err(format!("unsupported KV pool dtype {other:?}")),
+            }
             .map_err(|error| format!("cannot rebuild KV block {block}: {error}"))?;
             pool.slice_set(&tensor, 0, start)
                 .map_err(|error| format!("cannot write KV block {block}: {error}"))?;
@@ -846,6 +1224,23 @@ impl Qwen2Executor {
     pub fn gpu_bridge(&self) -> QwenGpuBridge {
         self.model.gpu_bridge()
     }
+
+    /// Force the custom kernel on/off for GPU parity tests. Production code
+    /// uses `Executor::forward`, which follows `NEXUSKV_CUDA_ATTENTION`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_cuda_attention(
+        &mut self,
+        block_manager: &mut BlockSpaceManager,
+        seq: SeqId,
+        tokens: &[u32],
+        start: usize,
+        all_logits: bool,
+        use_kernel: bool,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.model
+            .forward_inner(block_manager, seq, tokens, start, all_logits, use_kernel)
+    }
 }
 
 impl Executor for Qwen2Executor {
@@ -874,13 +1269,24 @@ impl Executor for Qwen2Executor {
     }
 
     fn name(&self) -> &'static str {
-        "qwen"
+        // `/v1/metrics` and `/v1/models` must distinguish real weights from
+        // the mock executor unambiguously.
+        "real"
+    }
+
+    fn attention_backend(&self) -> &'static str {
+        if self.model.cuda_attention {
+            "custom-cuda-f16"
+        } else {
+            "gather"
+        }
     }
 }
 
 fn load_shards_into_varmap(
     shards: &[PathBuf],
     device: &Device,
+    dtype: DType,
 ) -> anyhow::Result<candle_nn::VarMap> {
     let mut var_map = candle_nn::VarMap::new();
     // First pass: create every variable with its shape. Each shard is mmapped
@@ -894,7 +1300,7 @@ fn load_shards_into_varmap(
                 view.shape().to_vec(),
                 &name,
                 candle_nn::Init::Const(0.0),
-                DType::F32,
+                dtype,
                 device,
             )?;
         }
@@ -904,7 +1310,7 @@ fn load_shards_into_varmap(
         // SAFETY: same contract as the first pass.
         let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(shard)? };
         for (name, _) in tensors.tensors() {
-            let tensor = tensors.load(&name, device)?.to_dtype(DType::F32)?;
+            let tensor = tensors.load(&name, device)?.to_dtype(dtype)?;
             var_map.set_one(&name, tensor)?;
         }
     }
@@ -927,6 +1333,14 @@ pub fn load_model_and_tokenizer(
     }
 
     let device = select_device();
+    let dtype = model_dtype(&device);
+    tracing::info!(
+        "Model dtype: {dtype:?} (CUDA default is f16; set NEXUSKV_DTYPE=f32 to opt out)"
+    );
+    if device.is_cuda() && dtype == DType::F32 {
+        tracing::warn!("f32 CUDA selected; the KV pool must be clamped or VRAM will overflow");
+    }
+    log_vram("before model load");
     let mut shards: Vec<PathBuf> = fs::read_dir(directory)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
@@ -945,16 +1359,16 @@ pub fn load_model_and_tokenizer(
             "Loading {} safetensors shards sequentially (one mmap at a time)",
             shards.len()
         );
-        Some(load_shards_into_varmap(&shards, &device)?)
+        Some(load_shards_into_varmap(&shards, &device, dtype)?)
     } else {
         None
     };
     let vb = match &var_map {
-        Some(var_map) => NnVarBuilder::from_varmap(var_map, DType::F32, &device),
+        Some(var_map) => NnVarBuilder::from_varmap(var_map, dtype, &device),
         None => {
             // SAFETY: exactly one checkpoint shard is mmapped for the lifetime
             // of the builder; the operator supplies an immutable checkpoint.
-            unsafe { NnVarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)? }
+            unsafe { NnVarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? }
         }
     };
 
@@ -973,6 +1387,7 @@ pub fn load_model_and_tokenizer(
         engine_config.block_size,
         rope_positions,
     )?;
+    log_vram("after model + KV pool allocation");
     let concrete = Arc::new(QwenTokenizer::load(directory)?);
     let shared: Arc<dyn Tokenizer> = Arc::clone(&concrete) as Arc<dyn Tokenizer>;
     Ok((Qwen2Executor { model }, shared))
@@ -1280,6 +1695,26 @@ mod tests {
         bridge.write_block(5, &bytes).unwrap();
         assert_eq!(bridge.read_block(5).unwrap(), bytes);
         assert_ne!(bridge.read_block(4).unwrap(), bytes);
+    }
+
+    #[test]
+    fn gpu_bridge_roundtrips_f16_kv_bytes_at_half_the_size() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F16, &device);
+        let model = Qwen2Model::load(&config, &vb, device, 64, 4, 64).unwrap();
+        let mut bridge = model.gpu_bridge();
+        assert_eq!(bridge.dtype(), KvDType::F16);
+        // layers * (K+V) * block_size * kv_heads * head_dim
+        let values_per_block = 2 * 2 * 4 * 2 * 4;
+        assert_eq!(bridge.block_bytes(), values_per_block * 2);
+        let bytes: Vec<u8> = (0..bridge.block_bytes())
+            .map(|index| (index * 29 % 253) as u8)
+            .collect();
+        bridge.write_block(2, &bytes).unwrap();
+        assert_eq!(bridge.read_block(2).unwrap(), bytes);
+        assert!(bridge.write_block(2, &bytes[..32]).is_err());
     }
 
     #[test]

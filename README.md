@@ -26,11 +26,16 @@ Git-for-KV Sessions, Time Travel, and Tiered KV Memory — in Rust 2024.**
 
 ## 📸 Screenshots
 
-Live dashboard (mock executor, explicitly labeled):
+Live dashboard captured on the target machine with real Qwen3-0.6B f16 weights,
+`executor=real`, and the custom CUDA f16 decode kernel. The KV pipeline row shows
+measured prefill/skipped tokens, adaptive K, evictions, tier swap bytes, and the
+attention backend:
 
 ![NexusKV live dashboard](docs/dashboard-live.png)
 
-Time-travel replay driven by flight-recorder keyframes and memory events:
+Time-travel replay at tick 300 of the same run: a recorded keyframe plus memory
+events reconstructs the 6 active pages exactly. The HUD above keeps the last
+measured live performance values; only allocator state is replayed:
 
 ![NexusKV time-travel dashboard](docs/dashboard-time-travel.png)
 
@@ -47,24 +52,31 @@ Time-travel replay driven by flight-recorder keyframes and memory events:
 | Sessions | Commit pins full-block KV prefixes, checkout resumes in O(1) and branches independently, forget unpins |
 | Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, `GET /v1/timetravel?tick=N` |
 | Tiering | Content-addressed host LRU + NVMe spill, demand page-in on `Swapped` trie hits, fault-injection coverage |
-| Real model | Dense Qwen3-0.6B (primary) / Qwen2.5-0.5B-Instruct fallback behind `candle-model`; QK-norm, GQA, RoPE, SwiGLU, paged gather attention |
-| CUDA | `paged_decode_attention` with online softmax, `reshape_and_cache`, `copy_block`; GPU parity tests are `#[ignore]`d because this build machine has no NVIDIA GPU/nvcc |
+| Real model | Dense Qwen3-0.6B (primary) / Qwen2.5-0.5B-Instruct fallback behind `candle-model`; f16 CUDA weights and KV pools, f32 norm/softmax accumulation, QK-norm, GQA, RoPE, SwiGLU |
+| CUDA | f16 `paged_decode_attention` (f32 accumulation, GQA-correct) live in decode behind `NEXUSKV_CUDA_ATTENTION=1`, launched on candle's stream with automatic gather fallback; `reshape_and_cache`, `copy_block` |
+| Prefix hits | KV-valid trie blocks skip prefill compute; a block-aligned full re-hit computes zero prefill tokens (measured `prefill_tokens`/`prefix_skip_tokens`) |
 | Default build | CPU-only, no GPU, no CUDA toolkit, no model weights, all tests green |
 
 ### Target hardware and defaults
 
-The default engine configuration targets an **RTX 3050 4GB + 8GB system RAM
-(WSL2)** host:
+The default engine configuration targets an **RTX 3050 Laptop 4GB + 8GB system
+RAM on native Windows 11** (no WSL):
 
 - `total_physical_blocks = 192`
 - `block_size = 16`
 - `max_num_seqs = 8`
-- `max_blocks_per_seq = 24`
-- KV pool ≈ 344 MB at f16 (the current candle path stores f32; see limitations)
+- `max_blocks_per_seq = 40` (cap, not a reservation; supports a 512-token prompt)
+- CUDA weights and KV pools are f16; the CPU path stays f32
+- KV pool ≈ 344 MB at f16
 - Tier host budget defaults to `512 MiB`
 
-Builds on 8GB hosts should use `CARGO_BUILD_JOBS=2` (also set in
-`.cargo/config.toml`) to avoid OOM while linking candle.
+CUDA f16 is the default. `NEXUSKV_DTYPE=f32` forces f32 and automatically
+clamps the pool to 96 blocks / 4 sequences with a warning. Builds on 8GB hosts
+should use `CARGO_BUILD_JOBS=2` (also set in `.cargo/config.toml`) to avoid OOM
+while compiling candle.
+
+Native Windows setup, PowerShell build/run/test scripts, and the sysmem
+fallback note live in [WINDOWS_SETUP.md](WINDOWS_SETUP.md).
 
 ---
 
@@ -176,15 +188,28 @@ are detected and applied before RoPE; Qwen2 checkpoints use the same code path
 without them. Qwen3.5/3.6/3.8 Gated DeltaNet hybrid architectures are rejected
 with an explicit error.
 
-### CUDA decode kernel
+### CUDA decode kernel (native Windows)
 
-```bash
-# Requires nvcc and an NVIDIA GPU (sm_86 SASS + compute_86 PTX emitted)
-cargo run --release --features cuda -- --model /path/to/Qwen3-0.6B
+```powershell
+# Plain PowerShell: imports VS x64, resolves CUDA 12.6, builds the engine
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+
+$env:NEXUSKV_CUDA_ATTENTION = "1"
+powershell -ExecutionPolicy Bypass -File scripts/run_windows.ps1
 ```
 
-The correct CPU softmax reference is always available and tested without a GPU.
-CUDA parity and compute-sanitizer tests carry `#[ignore]` with hardware notes.
+The custom f16 kernel handles decode (`seq_len == 1`) on candle's device stream;
+prefill keeps gather attention. Without the env flag, or on any dtype /
+contiguity mismatch, the engine falls back to gather attention with a warning.
+GPU parity and compute-sanitizer tests are `#[ignore]`d for ordinary
+`cargo test`; run them on this machine with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/test_gpu.ps1
+```
+
+The CPU f32 softmax reference (including the GQA head mapping) is always
+available and tested without a GPU.
 
 ### Tiered KV (host + NVMe)
 
@@ -303,12 +328,34 @@ python3 scripts/bench_e2e.py \
 ```
 
 The script reports aggregate tok/s, TTFT p50/p99, ITL p50/p99, per-client
-throughput, prefix hit rate, acceptance, adaptive K, evictions, page faults, and
-tier counters. `--compare` prints the same-GPU/same-model llama.cpp comparison
-protocol; it does not assert a result on its own.
+throughput, prefix hit rate, prefill/skipped tokens, acceptance, adaptive K,
+evictions, page faults, and tier counters. `--prefix-probe` measures cold vs
+warm TTFT on a unique prompt re-hit. `--compare` prints the same-GPU/same-model
+llama.cpp comparison protocol; it does not assert a result on its own.
 
-No throughput, latency, or acceptance number is presented as a project result
-in this README. Mock-mode token rates measure bookkeeping and transport only.
+### Measured on this machine (2026-11-11)
+
+| Item | Value |
+| --- | --- |
+| Hardware | NVIDIA RTX 3050 Laptop 4 GB, driver 621.01, 8 GB RAM, Windows 11 |
+| Toolchain | Rust 1.99.1 MSVC, CUDA Toolkit 12.6, Visual Studio 2022 Build Tools (MSVC 14.44) |
+| Model | Qwen/Qwen3-0.6B, f16 weights and f16 KV pools |
+| Engine | 192 blocks × 16 tokens, max 8 sequences, custom CUDA f16 decode + gather prefill |
+| VRAM (nvidia-smi) | **1,753 MiB / 4,096 MiB** after model + KV pool + traffic |
+| 4 clients × 64 tokens, spec on | **23.76 tok/s** aggregate, per client 6.25 tok/s |
+| TTFT p50 / p99 | **641.4 ms / 706.3 ms** |
+| ITL p50 / p99 | **154.0 ms / 232.9 ms** |
+| Speculative acceptance / adaptive K | **4.5% / K=4** on this paraphrase prompt (not cherry-picked) |
+| Evictions / page faults / swap | 0 / 0 / 0 bytes (pool not under pressure in this run) |
+| 512-token aligned prefix re-hit | TTFT **243.6 ms → 3.01 ms (80.9×)**; cold prefill 512 tokens, warm prefill **0**, 512 skipped |
+| Dashboard single request (warm prefix) | 22.1 tok/s, TTFT 206.5 ms, ITL 44.1 ms |
+
+Raw JSON is written to `benches/results/` (gitignored, local evidence):
+`rtx3050-qwen3-0.6b-f16.json` and `rtx3050-prefix-512.json`.
+
+Mock-mode token rates measure bookkeeping and transport only and are never
+presented as model inference. The numbers above are single-run measurements on
+this GPU; they are not a comparison against another engine.
 
 ---
 
@@ -339,7 +386,12 @@ Coverage highlights:
   acceptance defaults, or dashboard playback simulations.
 
 GPU tests are the only `#[ignore]`d tests; each carries a hardware comment and
-is run with `scripts/sanitize.sh` on a CUDA machine.
+is run on this machine with `scripts/test_gpu.ps1` (f32/f16 kernel parity,
+f16 GQA parity vs the CPU oracle, real-weight logit L2 parity + greedy token
+identity, and the real-model determinism test). `scripts/sanitize.ps1` runs
+compute-sanitizer; on Windows WDDM it requires the one-time Administrator step
+documented in [WINDOWS_SETUP.md](WINDOWS_SETUP.md#7-gpu-tests). If that interface
+is not enabled, the script exits 2 rather than claiming a clean run.
 
 ---
 
@@ -381,14 +433,13 @@ nexuskv/
 
 ## ⚠️ Known limitations
 
-- The custom CUDA kernel is parity-tested against the CPU oracle but is not yet
-  wired to candle's persistent pool tensors; the candle path uses gather
-  attention on the selected device. This is recorded in `DECISIONS.md`.
-- Weights load as f32, so memory use is higher than an f16 deployment. The tier
-  bridge also uses an f32 byte container; raw device-to-host copies and dtype-
-  aware serialization are the documented optimization path.
-- v1 recomputes prefill even on resident trie hits. Hits save memory, not
-  compute yet; the code carries `// TODO(kv-valid)` at the exact spot.
+- The custom f16 CUDA kernel is wired into **decode only**
+  (`NEXUSKV_CUDA_ATTENTION=1`, `seq_len == 1`). Prefill still uses candle's
+  gather attention; the kernel path falls back to gather on any dtype,
+  contiguity, or launch mismatch with a one-time warning.
+- CUDA weights and KV pools are f16. `NEXUSKV_DTYPE=f32` is supported but
+  automatically clamps the pool to 96 blocks / 4 sequences because f32 weights
+  plus 192 f32 blocks do not fit in 4 GB.
 - A single sequence cannot exceed the resident block pool: active blocks are not
   evictable. The 8-block/200-token tiering e2e completes 200 tokens across
   sequences with a shared prefix, forcing swap-out/page-in between rounds.
@@ -396,6 +447,11 @@ nexuskv/
   labeled at startup.
 - The Qwen3.5/3.6/3.8 hybrid architectures are rejected; only dense Qwen3/Qwen2
   checkpoints are supported.
+- Tier spill files use the NKV2 dtype-tagged format. Legacy NKV1 files are
+  rejected loudly; delete an old swap directory before reusing it.
+- Full-prefix re-hits serve first-token logits from a bounded 8-entry cache
+  measured at prefill time. A cache miss performs one last-token forward and
+  counts it honestly in `prefill_tokens`.
 
 ---
 

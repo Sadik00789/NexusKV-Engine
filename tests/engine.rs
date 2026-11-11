@@ -206,6 +206,77 @@ async fn concurrent_sequences_share_prefix_blocks() {
     }
 }
 
+async fn generate_tokens(state: &AppState, prompt: Vec<u32>, max_tokens: usize) -> Vec<u32> {
+    let seq = state.next_sequence_id();
+    let (tx, mut rx) = unbounded_channel();
+    state
+        .request_tx
+        .send(Request::Generate(GenerateJob {
+            seq,
+            prompt,
+            max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            spec: false,
+            tx,
+        }))
+        .unwrap();
+    let mut tokens = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out")
+        {
+            Some(TokenMsg::Token { id, .. }) => tokens.push(id),
+            Some(TokenMsg::Done { .. }) => break,
+            Some(TokenMsg::Error { message }) => panic!("unexpected error: {message}"),
+            None => break,
+        }
+    }
+    tokens
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_block_aligned_prompt_skips_all_prefill_compute() {
+    let state = AppState::mock(test_config());
+    // 48 tokens = 12 blocks at the test block size of 4, leaving room for the
+    // output within max_blocks_per_seq=16.
+    let prompt: Vec<u32> = (0..48).map(|index| (index % 251) as u32).collect();
+
+    let first = generate_tokens(&state, prompt.clone(), 12).await;
+    for _ in 0..200 {
+        if state.snapshot().prefill_tokens >= prompt.len() as u64 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let before = state.snapshot();
+    assert_eq!(before.prefill_tokens, prompt.len() as u64);
+
+    let second = generate_tokens(&state, prompt.clone(), 12).await;
+    for _ in 0..200 {
+        if state.snapshot().total_tokens_generated >= 24 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let after = state.snapshot();
+    assert_eq!(
+        first, second,
+        "greedy output must be identical with prefill skipped"
+    );
+    assert_eq!(
+        after.prefill_tokens, before.prefill_tokens,
+        "second full-prefix request must not recompute prefill tokens"
+    );
+    assert!(
+        after.prefix_skip_tokens >= before.prefix_skip_tokens + prompt.len() as u64,
+        "second request must report the reused prompt tokens: before={} after={}",
+        before.prefix_skip_tokens,
+        after.prefix_skip_tokens
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn greedy_decoding_is_deterministic_across_requests() {
     let state = AppState::mock(test_config());

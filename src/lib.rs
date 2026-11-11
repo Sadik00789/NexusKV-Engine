@@ -5,6 +5,7 @@
 //! inference lives behind the `candle-model` feature and custom CUDA kernels
 //! behind `cuda` (which implies `candle-model`).
 
+pub mod build_support;
 pub mod config;
 pub mod engine;
 pub mod kernels;

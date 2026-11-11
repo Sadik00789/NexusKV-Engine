@@ -10,6 +10,91 @@ fn refs(bm: &BlockSpaceManager) -> Vec<usize> {
 }
 
 #[test]
+fn kv_valid_prefix_is_block_aligned_and_only_counts_written_blocks() {
+    let mut manager = bm(16, 4, 8);
+    let prompt: Vec<u32> = (1..=12).collect();
+    let first = manager
+        .match_or_allocate_prefix_with_validity(1, &prompt)
+        .unwrap();
+    assert_eq!(first.hit_blocks, 0);
+    assert_eq!(first.valid_tokens, 0);
+
+    // Only the first two full blocks were written.
+    assert_eq!(manager.mark_kv_valid(1, 0, 8), 2);
+    assert_eq!(manager.valid_prefix_tokens(1), 8);
+    manager.assert_invariants();
+    manager.free_sequence(1).unwrap();
+
+    let second = manager
+        .match_or_allocate_prefix_with_validity(2, &prompt)
+        .unwrap();
+    assert_eq!(second.hit_blocks, 3);
+    assert_eq!(second.valid_tokens, 8);
+
+    // The remaining block is written now; the next match can skip the whole
+    // block-aligned prompt.
+    assert_eq!(manager.mark_kv_valid(2, 8, 4), 1);
+    manager.free_sequence(2).unwrap();
+    let third = manager
+        .match_or_allocate_prefix_with_validity(3, &prompt)
+        .unwrap();
+    assert_eq!(third.valid_tokens, 12);
+    manager.assert_invariants();
+}
+
+#[test]
+fn kv_valid_unaligned_prompt_skips_only_full_blocks() {
+    let mut manager = bm(8, 4, 8);
+    let prompt: Vec<u32> = (1..=10).collect();
+    manager.match_or_allocate_prefix(1, &prompt).unwrap();
+    assert_eq!(manager.mark_kv_valid(1, 0, prompt.len()), 2);
+    assert_eq!(manager.valid_prefix_tokens(1), 8);
+    manager.free_sequence(1).unwrap();
+    let matched = manager
+        .match_or_allocate_prefix_with_validity(2, &prompt)
+        .unwrap();
+    assert_eq!(matched.valid_tokens, 8, "partial tail cannot be skipped");
+}
+
+#[test]
+fn drop_mode_eviction_invalidates_detached_nodes() {
+    let mut manager = bm(4, 4, 8);
+    let prompt: Vec<u32> = (1..=8).collect();
+    manager.match_or_allocate_prefix(1, &prompt).unwrap();
+    manager.mark_kv_valid(1, 0, prompt.len());
+    manager.free_sequence(1).unwrap();
+    assert!(manager.evict_one().unwrap());
+    assert!(manager.evict_one().unwrap());
+    manager.assert_invariants();
+    let matched = manager
+        .match_or_allocate_prefix_with_validity(2, &prompt)
+        .unwrap();
+    assert_eq!(
+        matched.valid_tokens, 0,
+        "dropped KV must never be reported valid"
+    );
+}
+
+#[test]
+fn swapped_blocks_keep_their_validity_after_page_in() {
+    let io = TestIo::new();
+    let mut manager = BlockSpaceManager::with_io(4, 4, 8, Box::new(io));
+    let prompt: Vec<u32> = (1..=8).collect();
+    manager.match_or_allocate_prefix(1, &prompt).unwrap();
+    manager.mark_kv_valid(1, 0, prompt.len());
+    manager.free_sequence(1).unwrap();
+    assert!(manager.evict_one().unwrap(), "one leaf must be spilled");
+    assert_eq!(manager.stats().page_faults, 0);
+
+    let matched = manager
+        .match_or_allocate_prefix_with_validity(2, &prompt)
+        .unwrap();
+    assert_eq!(matched.valid_tokens, 8);
+    assert_eq!(manager.stats().page_faults, 1);
+    manager.assert_invariants();
+}
+
+#[test]
 fn regression_b1_stale_trie() {
     // B1: freeing a sequence must not leave the trie pointing at a block that
     // can be handed out by the free stack (dual ownership / UAF).

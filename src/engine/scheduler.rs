@@ -110,6 +110,10 @@ pub struct PrefillChunk {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Batch {
     pub prefill: Vec<PrefillChunk>,
+    /// Prompt already fully resident and valid: no prefill compute is needed,
+    /// but the first token still requires cached logits (or a one-token
+    /// forward). The actor handles these before decodes.
+    pub first_token: Vec<SeqId>,
     pub decode: Vec<SeqId>,
     /// Sequences preempted while building this batch. The actor resets their
     /// drafters and the batch entries for them were already removed.
@@ -118,7 +122,7 @@ pub struct Batch {
 
 impl Batch {
     pub fn is_empty(&self) -> bool {
-        self.prefill.is_empty() && self.decode.is_empty()
+        self.prefill.is_empty() && self.first_token.is_empty() && self.decode.is_empty()
     }
 
     pub fn token_count(&self) -> usize {
@@ -139,6 +143,9 @@ pub struct Scheduler {
     running: HashMap<SeqId, Seq>,
     order: VecDeque<SeqId>,
     pub preemptions: u64,
+    /// Prompt tokens whose KV was reused instead of recomputed because a trie
+    /// hit was already validated by an earlier forward pass.
+    pub skipped_prefill_tokens: u64,
 }
 
 impl Scheduler {
@@ -155,6 +162,7 @@ impl Scheduler {
             running: HashMap::new(),
             order: VecDeque::new(),
             preemptions: 0,
+            skipped_prefill_tokens: 0,
         }
     }
 
@@ -188,9 +196,9 @@ impl Scheduler {
             }
         }
 
-        // Running prefills are chunked into the remaining budget.
-        // TODO(kv-valid): skip prefill compute on resident trie hits. v1
-        // recomputes prompt tokens even when match_or_allocate_prefix hit.
+        // Running prefills are chunked into the remaining budget. Admission
+        // sets `computed` to the leading KV-valid prefix, so these chunks never
+        // include a resident valid block.
         for id in &running_ids {
             if budget == 0 {
                 break;
@@ -220,16 +228,20 @@ impl Scheduler {
             let seq_id = seq.id;
             let prompt_len = seq.prompt.len();
             let admission = if seq.attached {
-                Ok(())
+                Ok(crate::memory::PrefixMatch {
+                    hit_blocks: 0,
+                    valid_tokens: seq.computed,
+                })
             } else {
-                block_manager
-                    .match_or_allocate_prefix(seq_id, &seq.prompt)
-                    .map(|_| ())
+                block_manager.match_or_allocate_prefix_with_validity(seq_id, &seq.prompt)
             };
             match admission {
-                Ok(()) => {
+                Ok(matched) => {
                     if !seq.attached {
-                        seq.computed = 0;
+                        // KV-valid hits are a prefix; everything after the
+                        // first unwritten block is recomputed.
+                        seq.computed = matched.valid_tokens;
+                        self.skipped_prefill_tokens += matched.valid_tokens as u64;
                     }
                     let computed = seq.computed;
                     self.order.push_back(seq_id);
@@ -243,12 +255,23 @@ impl Scheduler {
                             len,
                         });
                         budget -= len;
+                    } else if self
+                        .running
+                        .get(&seq_id)
+                        .map(Seq::out_is_empty)
+                        .unwrap_or(false)
+                    {
+                        // Full prefix hit: no KV work, but the first token still
+                        // needs logits. The actor serves cached prefill logits
+                        // or performs one last-token forward if absent.
+                        batch.first_token.push(seq_id);
                     }
                 }
                 Err(MemoryError::OutOfMemory) => {
                     if let Some(victim) = self.preempt_newest(block_manager) {
                         batch.decode.retain(|id| *id != victim);
                         batch.prefill.retain(|chunk| chunk.seq != victim);
+                        batch.first_token.retain(|id| *id != victim);
                         batch.preempted.push(victim);
                         self.preemptions += 1;
                         self.waiting.push_front(seq);

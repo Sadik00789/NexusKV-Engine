@@ -65,14 +65,24 @@ fn fuzz_run(seed: u64, tier: bool, blocks: usize, operations: usize) {
             }
             let seq = next_seq;
             next_seq += 1;
-            if manager.match_or_allocate_prefix(seq, &prompt).is_ok()
-                && let Some(table) = manager.page_table(seq)
-            {
-                live.push(LiveSequence {
-                    id: seq,
-                    prompt_len: table.prompt_len,
-                    tokens: table.logical_tokens,
-                });
+            if let Ok(matched) = manager.match_or_allocate_prefix_with_validity(seq, &prompt) {
+                assert!(matched.valid_tokens <= prompt.len());
+                assert_eq!(matched.valid_tokens % 4, 0);
+                // Simulate a forward covering an arbitrary prefix.
+                let mark_end = rng.below(prompt.len() as u64 + 1) as usize;
+                manager.mark_kv_valid(seq, 0, mark_end);
+                let expected = matched
+                    .valid_tokens
+                    .max((mark_end / 4) * 4)
+                    .min((prompt.len() / 4) * 4);
+                assert_eq!(manager.valid_prefix_tokens(seq), expected);
+                if let Some(table) = manager.page_table(seq) {
+                    live.push(LiveSequence {
+                        id: seq,
+                        prompt_len: table.prompt_len,
+                        tokens: table.logical_tokens,
+                    });
+                }
             }
             manager.assert_invariants();
             continue;
@@ -88,14 +98,23 @@ fn fuzz_run(seed: u64, tier: bool, blocks: usize, operations: usize) {
             }
             let seq = next_seq;
             next_seq += 1;
-            if manager.match_or_allocate_prefix(seq, &prompt).is_ok()
-                && let Some(table) = manager.page_table(seq)
-            {
-                live.push(LiveSequence {
-                    id: seq,
-                    prompt_len: table.prompt_len,
-                    tokens: table.logical_tokens,
-                });
+            if let Ok(matched) = manager.match_or_allocate_prefix_with_validity(seq, &prompt) {
+                assert!(matched.valid_tokens <= prompt.len());
+                assert_eq!(matched.valid_tokens % 4, 0);
+                let mark_end = rng.below(prompt.len() as u64 + 1) as usize;
+                manager.mark_kv_valid(seq, 0, mark_end);
+                let expected = matched
+                    .valid_tokens
+                    .max((mark_end / 4) * 4)
+                    .min((prompt.len() / 4) * 4);
+                assert_eq!(manager.valid_prefix_tokens(seq), expected);
+                if let Some(table) = manager.page_table(seq) {
+                    live.push(LiveSequence {
+                        id: seq,
+                        prompt_len: table.prompt_len,
+                        tokens: table.logical_tokens,
+                    });
+                }
             }
         } else if choice < 45 {
             let idx = rng.below(live.len() as u64) as usize;
@@ -171,6 +190,17 @@ fn fuzz_all_invariants() {
     // High-pressure run with a tiny pool.
     fuzz_run(2024, true, 10, 12_000);
     fuzz_run(2025, false, 10, 12_000);
+}
+
+/// Focused KV-validity fuzz: every match reports a block-aligned valid prefix,
+/// marking writes extends it monotonically, and eviction to swapped keeps it
+/// (drop-mode eviction detaches the node and invalidates it).
+#[test]
+fn kv_valid_prefix_fuzz() {
+    for seed in [1337u64, 42, 7, 99] {
+        fuzz_run(seed, true, 24, 8000);
+        fuzz_run(seed, false, 24, 8000);
+    }
 }
 
 use proptest::prelude::*;

@@ -97,6 +97,7 @@ impl AppState {
         let snapshot = Arc::new(Mutex::new(Snapshot::initial(
             &model_id,
             &executor_name,
+            executor.attention_backend(),
             config.total_physical_blocks,
             config.block_size,
         )));
@@ -225,6 +226,9 @@ pub struct TelemetryPayload {
     pub speculative_acceptance_rate: f64,
     pub adaptive_k: usize,
     pub executor: String,
+    pub attention_backend: String,
+    pub prefill_tokens: u64,
+    pub prefix_skip_tokens: u64,
     pub active_block_ids: Vec<usize>,
     pub event_tick: u64,
     pub is_finished: bool,
@@ -428,6 +432,9 @@ fn telemetry_payload(
         speculative_acceptance_rate: snapshot.speculative_acceptance_rate,
         adaptive_k: snapshot.adaptive_k,
         executor: snapshot.executor,
+        attention_backend: snapshot.attention_backend,
+        prefill_tokens: snapshot.prefill_tokens,
+        prefix_skip_tokens: snapshot.prefix_skip_tokens,
         active_block_ids,
         event_tick: snapshot.event_tick,
         is_finished,

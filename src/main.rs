@@ -29,7 +29,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("==================================================");
 
     let cli = parse_args()?;
-    let config = EngineConfig::default();
+    #[allow(unused_mut)]
+    let mut config = EngineConfig::default();
+    #[cfg(feature = "cuda")]
+    if cli.model.is_some() && nexuskv::model::qwen::cuda_f32_requested() {
+        config.clamp_for_f32_cuda();
+        tracing::warn!(
+            "NEXUSKV_DTYPE=f32 on CUDA: clamping to 96 blocks / 4 sequences to stay under 4 GB VRAM"
+        );
+    }
     tracing::info!(
         "Physical KV pool: {} blocks ({} tokens/block)",
         config.total_physical_blocks,

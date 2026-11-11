@@ -19,6 +19,8 @@ candle-model = [
     "dep:candle-core",
     "dep:candle-nn",
     "dep:tokenizers",
+    "dep:half",
+    "dep:bytemuck",
 ]
 cuda = [
     "candle-model",
@@ -42,7 +44,14 @@ async-stream = "0.3"
 # Real-model stack. Optional: the default build has no GPU, CUDA, or weights.
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
-tokenizers = { version = "0.21", optional = true }
+# default-features = false drops the C++ esaxx_fast path (whose crate hardcodes
+# .static_crt(true) and breaks MSVC dynamic-CRT linking) and onig. Qwen uses a
+# ByteLevel tokenizer and needs neither.
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
+# f16 KV pools and dtype-aware tier serialization. Only the candle model path
+# needs these; the default build stays dependency-light.
+half = { version = "2.7", features = ["bytemuck"], optional = true }
+bytemuck = { version = "1.25", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

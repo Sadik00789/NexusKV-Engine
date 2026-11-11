@@ -152,7 +152,11 @@ impl SessionStore {
         // Recompute the last resident token when the checkpoint is block
         // aligned; otherwise the scheduler re-prefills the partial tail. Both
         // paths need at least one forward pass to produce first-token logits.
-        let computed = full_tokens.min(node.tokens.len().saturating_sub(1));
+        // A commit taken mid-prefill only skips blocks whose KV was actually
+        // written, so checkout can never claim uncomputed KV.
+        let computed = block_manager
+            .valid_prefix_tokens(seq)
+            .min(node.tokens.len().saturating_sub(1));
         Ok(CheckoutSnapshot {
             tokens: node.tokens.clone(),
             computed,
@@ -286,6 +290,8 @@ mod tests {
         let mut block_manager = manager();
         let prompt: Vec<u32> = (1..=12).collect();
         block_manager.match_or_allocate_prefix(1, &prompt).unwrap();
+        // Simulate the forward pass that makes the committed KV valid.
+        block_manager.mark_kv_valid(1, 0, prompt.len());
         let mut sessions = SessionStore::new();
         let node = sessions
             .commit(
@@ -332,6 +338,8 @@ mod tests {
         let mut block_manager = manager();
         let prompt: Vec<u32> = (1..=10).collect();
         block_manager.match_or_allocate_prefix(1, &prompt).unwrap();
+        // Simulate the forward pass that makes the committed KV valid.
+        block_manager.mark_kv_valid(1, 0, prompt.len());
         let mut sessions = SessionStore::new();
         let node = sessions
             .commit(

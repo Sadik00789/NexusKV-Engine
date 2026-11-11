@@ -64,6 +64,7 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub executor: String,
+    pub attention_backend: String,
     pub model: String,
     pub total_blocks: usize,
     pub blocks: usize,
@@ -79,6 +80,10 @@ pub struct Snapshot {
     pub prefix_cache_hit_ratio: f64,
     pub prefix_cache_lookups: u64,
     pub prefix_cache_hits: u64,
+    /// Prompt tokens whose KV was reused rather than recomputed.
+    pub prefix_skip_tokens: u64,
+    /// Prompt tokens actually pushed through a forward pass (measured).
+    pub prefill_tokens: u64,
     pub speculative_acceptance_rate: f64,
     pub acceptance: f64,
     pub speculative_proposed: u64,
@@ -91,6 +96,8 @@ pub struct Snapshot {
     pub cow_copies: u64,
     pub swapped_out: u64,
     pub swapped_in: u64,
+    pub swap_bytes_out: u64,
+    pub swap_bytes_in: u64,
     pub disk_spills: u64,
     pub disk_loads: u64,
     pub preemptions: u64,
@@ -102,9 +109,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn initial(model: &str, executor: &str, total_blocks: usize, block_size: usize) -> Self {
+    pub fn initial(
+        model: &str,
+        executor: &str,
+        attention_backend: &str,
+        total_blocks: usize,
+        block_size: usize,
+    ) -> Self {
         Self {
             executor: executor.to_string(),
+            attention_backend: attention_backend.to_string(),
             model: model.to_string(),
             total_blocks,
             blocks: total_blocks,
@@ -120,6 +134,8 @@ impl Snapshot {
             prefix_cache_hit_ratio: 0.0,
             prefix_cache_lookups: 0,
             prefix_cache_hits: 0,
+            prefix_skip_tokens: 0,
+            prefill_tokens: 0,
             speculative_acceptance_rate: 0.0,
             acceptance: 0.0,
             speculative_proposed: 0,
@@ -132,6 +148,8 @@ impl Snapshot {
             cow_copies: 0,
             swapped_out: 0,
             swapped_in: 0,
+            swap_bytes_out: 0,
+            swap_bytes_in: 0,
             disk_spills: 0,
             disk_loads: 0,
             preemptions: 0,
@@ -204,6 +222,21 @@ pub struct EngineActor {
     ttfts: VecDeque<f64>,
     total_tokens: u64,
     model_id: String,
+    /// Measured final-prefill logits keyed by the full prompt. A repeated
+    /// full-prefix hit can emit its first token with zero prefill forwards.
+    prefill_logits: HashMap<u64, Vec<f32>>,
+    prefill_logits_order: VecDeque<u64>,
+    prefill_tokens: u64,
+}
+
+const PREFILL_LOGIT_CACHE_ENTRIES: usize = 8;
+
+fn prompt_key(tokens: &[u32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ (tokens.len() as u64);
+    for &token in tokens {
+        hash = (hash ^ u64::from(token)).wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 impl EngineActor {
@@ -232,6 +265,9 @@ impl EngineActor {
             ttfts: VecDeque::new(),
             total_tokens: 0,
             model_id,
+            prefill_logits: HashMap::new(),
+            prefill_logits_order: VecDeque::new(),
+            prefill_tokens: 0,
         }
     }
 
@@ -317,6 +353,7 @@ impl EngineActor {
                 let mut drafter = LookupDrafter::new(DRAFT_NGRAM);
                 drafter.observe(&job.prompt);
                 self.drafters.insert(job.seq, drafter);
+                self.executor.prepare_sequence(job.seq, &job.prompt);
                 let seq = Seq::new(
                     job.seq,
                     job.prompt,
@@ -379,6 +416,7 @@ impl EngineActor {
                         let mut drafter = LookupDrafter::new(DRAFT_NGRAM);
                         drafter.observe(&snapshot.tokens);
                         self.drafters.insert(job.seq, drafter);
+                        self.executor.prepare_sequence(job.seq, &snapshot.tokens);
                         let mut seq = Seq::new(
                             job.seq,
                             snapshot.tokens,
@@ -414,6 +452,9 @@ impl EngineActor {
         let mut produced = 0usize;
         for chunk in &batch.prefill {
             produced += self.run_prefill(chunk);
+        }
+        for seq in &batch.first_token {
+            produced += self.emit_first_token(*seq);
         }
         for seq in &batch.decode {
             produced += self.run_decode(*seq);
@@ -453,19 +494,95 @@ impl EngineActor {
             }
         };
         self.apply_pending_copies();
+        self.prefill_tokens += chunk.len as u64;
+        // The forward pass wrote these slots; only now may a future trie hit
+        // skip their compute.
+        self.block_manager
+            .mark_kv_valid(seq_id, chunk.start, chunk.len);
 
-        let prompt_done = {
+        let (prompt_done, key) = {
             let Some(seq) = self.scheduler.seq_mut(seq_id) else {
                 return 0;
             };
             seq.computed += chunk.len;
-            seq.computed == seq.prompt.len()
+            (seq.computed == seq.prompt.len(), prompt_key(&seq.prompt))
         };
         if !prompt_done {
             return 0;
         }
 
         let last_logits = logits.pop().unwrap_or_default();
+        self.cache_prefill_logits(key, last_logits.clone());
+        self.emit_sampled_token(seq_id, last_logits, temperature, top_p)
+    }
+
+    /// Emit the first token for a sequence whose prompt is already fully valid.
+    /// Uses measured logits from the earlier prefill; if they are absent (for
+    /// example a partially pre-filled commit), it falls back to a one-token
+    /// forward and records that cost honestly.
+    fn emit_first_token(&mut self, seq_id: SeqId) -> usize {
+        let (prompt, temperature, top_p, key) = {
+            let Some(seq) = self.scheduler.seq(seq_id) else {
+                return 0;
+            };
+            if seq.prompt.is_empty() {
+                return 0;
+            }
+            (
+                seq.prompt.clone(),
+                seq.temperature,
+                seq.top_p,
+                prompt_key(&seq.prompt),
+            )
+        };
+        let logits = match self.prefill_logits.get(&key).cloned() {
+            Some(logits) => logits,
+            None => {
+                let start = prompt.len() - 1;
+                let mut rows = match self.executor.forward(
+                    &mut self.block_manager,
+                    seq_id,
+                    &prompt[start..],
+                    start,
+                    false,
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        self.fail_seq(seq_id, format!("first-token forward failed: {err}"));
+                        return 0;
+                    }
+                };
+                self.apply_pending_copies();
+                self.prefill_tokens += 1;
+                let row = rows.pop().unwrap_or_default();
+                self.cache_prefill_logits(key, row.clone());
+                row
+            }
+        };
+        self.emit_sampled_token(seq_id, logits, temperature, top_p)
+    }
+
+    fn cache_prefill_logits(&mut self, key: u64, logits: Vec<f32>) {
+        if self.prefill_logits.contains_key(&key) {
+            return;
+        }
+        if self.prefill_logits_order.len() >= PREFILL_LOGIT_CACHE_ENTRIES
+            && let Some(evicted) = self.prefill_logits_order.pop_front()
+        {
+            self.prefill_logits.remove(&evicted);
+        }
+        self.prefill_logits.insert(key, logits);
+        self.prefill_logits_order.push_back(key);
+    }
+
+    /// Shared sampling/emission tail for prefill and cached-first-token paths.
+    fn emit_sampled_token(
+        &mut self,
+        seq_id: SeqId,
+        last_logits: Vec<f32>,
+        temperature: f32,
+        top_p: f32,
+    ) -> usize {
         let mut rng = SpecRng::new(
             self.scheduler
                 .seq(seq_id)
@@ -750,6 +867,7 @@ impl EngineActor {
 
         let snapshot = Snapshot {
             executor: self.executor.name().to_string(),
+            attention_backend: self.executor.attention_backend().to_string(),
             model: self.model_id.clone(),
             total_blocks: total,
             blocks: total,
@@ -765,6 +883,8 @@ impl EngineActor {
             prefix_cache_hit_ratio: self.block_manager.prefix_cache_hit_ratio(),
             prefix_cache_lookups: stats.lookups,
             prefix_cache_hits: stats.hits,
+            prefix_skip_tokens: self.scheduler.skipped_prefill_tokens,
+            prefill_tokens: self.prefill_tokens,
             speculative_acceptance_rate: acceptance,
             acceptance,
             speculative_proposed: self.spec_stats.proposed,
@@ -777,6 +897,8 @@ impl EngineActor {
             cow_copies: stats.cow_copies,
             swapped_out: io_stats.swapped_out,
             swapped_in: io_stats.swapped_in,
+            swap_bytes_out: io_stats.swap_bytes_out,
+            swap_bytes_in: io_stats.swap_bytes_in,
             disk_spills: io_stats.disk_spills,
             disk_loads: io_stats.disk_loads,
             preemptions: self.scheduler.preemptions,

@@ -4,6 +4,7 @@
 import React, { useState, useEffect } from "react";
 import { VramBlockCanvas, BlockInspectData } from "@/components/VramBlockCanvas";
 import { MetricsPanel } from "@/components/MetricsPanel";
+import { PipelinePanel, type PipelineMetrics } from "@/components/PipelinePanel";
 import {
     applyReplay,
     countAllocated,
@@ -61,6 +62,16 @@ export default function Home() {
     const [activeBlockIds, setActiveBlockIds] = useState<number[]>([]);
     const [blocksMetadata, setBlocksMetadata] = useState<BlockInspectData[] | undefined>(undefined);
     const [executor, setExecutor] = useState<string>("unknown");
+    const [pipeline, setPipeline] = useState<PipelineMetrics>({
+        prefillTokens: 0,
+        prefixSkipTokens: 0,
+        adaptiveK: 0,
+        evictions: 0,
+        pageFaults: 0,
+        swapBytesOut: 0,
+        swapBytesIn: 0,
+        attentionBackend: "unknown",
+    });
 
     // Time-travel + sessions
     const [latestTick, setLatestTick] = useState(0);
@@ -93,6 +104,16 @@ export default function Home() {
                     setPrefixCacheHitRatio(Number(data.prefix_cache_hit_ratio ?? 0));
                     setAcceptanceRate(Number(data.speculative_acceptance_rate ?? 0));
                     setLatestTick(Number(data.event_tick ?? 0));
+                    setPipeline({
+                        prefillTokens: Number(data.prefill_tokens ?? 0),
+                        prefixSkipTokens: Number(data.prefix_skip_tokens ?? 0),
+                        adaptiveK: Number(data.adaptive_k ?? 0),
+                        evictions: Number(data.evictions ?? 0),
+                        pageFaults: Number(data.page_faults ?? 0),
+                        swapBytesOut: Number(data.swap_bytes_out ?? 0),
+                        swapBytesIn: Number(data.swap_bytes_in ?? 0),
+                        attentionBackend: String(data.attention_backend ?? "unknown"),
+                    });
                     if (data.block_inspect_info) {
                         setBlocksMetadata(data.block_inspect_info);
                     }
@@ -159,18 +180,39 @@ export default function Home() {
                     try {
                         const data = JSON.parse(rawJson);
                         if (data.sequence_id !== undefined) setSequenceId(data.sequence_id);
+                        const hasToken =
+                            typeof data.token === "string" && data.token.length > 0;
                         if (typeof data.token === "string") {
                             setGeneratedText((prev) => prev + data.token);
                         }
-                        setTokensPerSec(Number(data.tokens_per_sec ?? 0));
-                        setTtftMs(Number(data.ttft_ms ?? 0));
-                        setItlMs(Number(data.itl_ms ?? 0));
+                        // The terminal empty-token frame only reports a
+                        // near-zero settling gap; keep the last token's measured
+                        // timing instead of blanking the HUD after completion.
+                        if (hasToken) {
+                            const nextTps = Number(data.tokens_per_sec ?? 0);
+                            if (nextTps > 0) setTokensPerSec(nextTps);
+                            const nextTtft = Number(data.ttft_ms ?? 0);
+                            if (nextTtft > 0) setTtftMs(nextTtft);
+                            const nextItl = Number(data.itl_ms ?? 0);
+                            if (nextItl > 0) setItlMs(nextItl);
+                        }
                         setAllocatedBlocks(Number(data.allocated_blocks ?? 0));
                         setTotalBlocks(Number(data.total_blocks ?? 512));
                         setMemoryRatio(Number(data.memory_usage_ratio ?? 0));
                         setPrefixCacheHitRatio(Number(data.prefix_cache_hit_ratio ?? 0));
                         setAcceptanceRate(Number(data.speculative_acceptance_rate ?? 0));
                         setLatestTick(Number(data.event_tick ?? 0));
+                        setPipeline((previous) => ({
+                            ...previous,
+                            prefillTokens: Number(data.prefill_tokens ?? previous.prefillTokens),
+                            prefixSkipTokens: Number(
+                                data.prefix_skip_tokens ?? previous.prefixSkipTokens
+                            ),
+                            adaptiveK: Number(data.adaptive_k ?? previous.adaptiveK),
+                            attentionBackend: String(
+                                data.attention_backend ?? previous.attentionBackend
+                            ),
+                        }));
                         if (Array.isArray(data.active_block_ids)) {
                             setActiveBlockIds(data.active_block_ids);
                         }
@@ -339,7 +381,9 @@ export default function Home() {
                                     engineOnline ? "bg-emerald-400 animate-ping" : "bg-slate-500"
                                 }`}
                             ></span>
-                            {engineOnline ? `Engine Online (:8080) · ${executor}` : "Engine Offline — no telemetry"}
+                            {engineOnline
+                                ? `Engine Online (:8080) · ${executor} · ${pipeline.attentionBackend}`
+                                : "Engine Offline — no telemetry"}
                         </span>
                     </div>
                 </div>
@@ -365,6 +409,8 @@ export default function Home() {
                     prefixCacheHitRatio={prefixCacheHitRatio}
                     acceptanceRate={acceptanceRate}
                 />
+
+                <PipelinePanel metrics={pipeline} />
 
                 {/* Time-travel scrubber */}
                 <div className="bg-slate-900/90 border border-slate-800 p-5 rounded-2xl shadow-xl">

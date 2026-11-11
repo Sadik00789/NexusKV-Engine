@@ -322,3 +322,107 @@ This file records decisions, deviations, and the evidence behind them. Phases
   suite exercises every public allocator operation, both eviction modes,
   transactional failures, all scheduler paths, and the actor/API paths; the gap
   is tooling, not ignored tests.
+
+## Phase 7 — Native Windows GPU bring-up
+
+- **Per-user CUDA 12.6 without Administrator.** The NVIDIA installer requires
+  elevation, which this session does not have. The toolkit was assembled from
+  the official 12.6 redistributable archives (nvcc, cudart, cublas, curand,
+  nvrtc, cccl, sanitizer API, nvJitLink) into `%USERPROFILE%\cuda-12.6` with the
+  normal `bin/include/lib\x64/nvvm` layout. The display driver was not touched.
+  `scripts/windows_env.ps1` resolves `CUDA_HOME`, `CUDA_PATH`, the per-user
+  tree, then the Program Files layout. CUDA 13.x was rejected because candle
+  0.9.2 was validated against 12.6 / cudarc 0.17–0.19.
+- **MSVC 14.44 is newer than CUDA 12.6's version table.** `NVCC_PREPEND_FLAGS`
+  and `NVCC_CCBIN` are set by `scripts/windows_env.ps1`, and `build.rs` adds
+  `-allow-unsupported-compiler` on MSVC. `bindgen_cuda` (candle-kernels) only
+  forwards that flag when `NVCC_CCBIN` is set, which is why both are required.
+  `NVCC_PREPEND_FLAGS` also carries `-Xcompiler /MD`: nvcc's Windows default
+  for `-c` objects is the static CRT (`/MT`), and bindgen_cuda does not override
+  it, so the MOE object would fail MSVC's `RuntimeLibrary` fail-if-mismatch
+  against Rust's `/MD` objects. `-cudart=shared` is kept so every object links
+  the shared CUDA runtime.
+- **`tokenizers` default features are disabled.** Its default `esaxx_fast`
+  feature compiles `esaxx-rs`'s C++ backend, whose build script hardcodes
+  `.static_crt(true)` (`/MT`) and cannot link against Rust's `/MD` objects on
+  Windows. Qwen uses a ByteLevel tokenizer, so the pure-Rust fallback is
+  sufficient; `--no-default-features` also drops onig. Tokenizer round-trip and
+  ChatML tests still pass.
+- **Build path logic is unit-tested.** `src/build_support.rs` owns CUDA root
+  precedence, Windows `lib\x64` vs Linux `lib64`/stubs, nvcc flags, and feature
+  gating. `build.rs` includes the same file, so the default test suite exercises
+  the exact resolution logic without invoking a build script.
+- **The GPU build never affects the default build.** `build.rs` returns before
+  touching nvcc unless `CARGO_FEATURE_CUDA` is set; `CUDA_PATH`/`CUDA_HOME` are
+  `rerun-if-env-changed` inputs.
+- **CUDA f16 is the default, CPU stays f32.** `model_dtype()` selects F16 for
+  CUDA and F32 for CPU. RMSNorm, RoPE, and softmax promote to f32 and cast back;
+  the KV pools and weights stay f16 on the device. `NEXUSKV_DTYPE=f32` opts out
+  and `EngineConfig::clamp_for_f32_cuda()` applies the documented 96-block /
+  4-sequence fallback with a warning. Startup logs measured VRAM from
+  `nvidia-smi` before and after the model/KV allocation.
+- **Tier format is NKV2 with a dtype tag.** The old NKV1 f32 container is
+  rejected loudly instead of decoded. f16 pools serialize raw half bytes, which
+  halves host tier bytes and spill traffic. `BlockIoStats` reports
+  `swap_bytes_out`/`swap_bytes_in` so benchmarks can show real bytes, not just
+  event counts.
+- **KV validity is tracked per trie node, not by deferring node insertion.**
+  The directive's intent — never skip compute for KV that a forward has not
+  written — is preserved by `TrieNode.kv_valid`: nodes created during page-table
+  allocation stay inert (`kv_valid = false`) until `mark_kv_valid` observes a
+  successful forward covering their full block. They may be shared, but a match
+  only reports a leading valid prefix; `valid_tokens` is block-aligned and
+  stops at the first unwritten block. Physical deferred insertion was not used
+  because it would complicate transactional rollback/CoW for no additional
+  safety; a future trie hit cannot observe `kv_valid` without it being set.
+  Detached nodes set `kv_valid = false`; swapped nodes keep it because their
+  content is on disk. Checkout uses `valid_prefix_tokens`, so a commit taken
+  mid-prefill cannot claim unwritten KV.
+- **`max_blocks_per_seq` default raised from 24 to 40.** The phase-7 prefix gate
+  requires a shared 512-token prompt (32 blocks) plus output blocks; the phase-6
+  cap of 24 blocks (384 tokens) made that sequence illegal. This value is only a
+  cap — the physical pool stays 192 blocks — so VRAM is unchanged. The RoPE
+  table is sized from `max_seq_token_length` (640) instead of 384.
+- **Full-prefix hits reuse measured first-token logits.** A block-aligned prompt
+  whose KV is entirely valid needs no forward pass for KV, but first-token
+  logits must come from somewhere. The actor keeps a bounded (8-entry) cache of
+  the final prefill logits keyed by the full prompt (FNV hash). A repeat hit
+  emits its first token with zero prefill tokens; on a cache miss it performs
+  one last-token forward and counts that token honestly. Cached logits are only
+  used when the KV prefix is valid, so an eviction cannot serve stale state.
+- **Mock state is prompt-seeded.** Prefix skipping means the first mock forward
+  may not contain the whole prompt. `Executor::prepare_sequence` seeds the
+  mock's deterministic offset and full history at admission, keeping greedy
+  output identical with skip on/off and across chunking. The real model ignores
+  the hook.
+- **The CUDA kernel's GQA mapping was already correct.** The kernel indexes
+  `kv_base` with `num_kv_heads` and maps `query head / (num_heads/num_kv_heads)`
+  (phase 3). The CPU oracle previously assumed `num_kv_heads == num_heads`; a
+  new `run_paged_attention_cpu_ref_gqa` and a 16Q/8KV unit test make the mapping
+  explicit and testable without a GPU.
+- **The f16 kernel accumulates in f32.** A `__half` template widens K/V to f32
+  for dot products, online softmax, and value accumulation, narrowing only the
+  output store. The live path launches on candle's device stream via
+  `CudaSlice::device_ptr` + `CudaStream::cu_stream`, asserts f16/contiguity, and
+  falls back to gather attention with a one-time warning on any mismatch. The
+  host-slice `run_paged_attention_f16` wrapper exists for parity tests.
+- **Decode-only scope.** `NEXUSKV_CUDA_ATTENTION=1` selects the custom kernel
+  for `seq_len == 1`; prefill keeps candle gather attention, as directed.
+  Gather attention now also accumulates `softmax × V` in f32 before narrowing,
+  matching the kernel's f32 accumulation; the real-weight parity test uses
+  relative L2 over the full 151k-vocab logit vector (<2e-2) plus top-1
+  equality, because per-element relative error near zero is dominated by f16
+  rounding. The measured max absolute logit difference is reported in the test
+  failure message.
+- **compute-sanitizer is blocked by WDDM in this non-admin session.** The
+  first run printed `Failed to initialize WDDM debugger interface` and
+  `Device not supported`; the tests executed but were not instrumented. The
+  script now exits 2 on that condition and prints the exact Administrator fix
+  (`compute-sanitizer\EnableDebuggerInterface.bat`). It no longer reports a
+  false "clean" result. This is an environment prerequisite, not a kernel
+  failure.
+- **Benchmarks remain honest.** `bench_e2e.py` adds a cold-vs-warm prefix probe
+  (unique nonce, identical re-hit) and reports prefill tokens, skipped tokens,
+  swap bytes, and the existing measured latency/throughput counters. It never
+  asserts a comparison against another engine.
+

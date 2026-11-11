@@ -1,5 +1,6 @@
 // csrc/paged_attention.cu
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <float.h>
 #include <math.h>
@@ -25,12 +26,30 @@
  *   l = l * corr + p; acc[d] = acc[d] * corr + p * v[d]; out = acc / l
  *
  * head_dim is limited to 128 so each thread owns one output dimension.
+ *
+ * The kernel is templated over float and __half. Half inputs are widened to
+ * float for the dot product, online softmax, and value accumulation; only the
+ * final store narrows back to half. GQA maps query head h to
+ * kv_head = h / (num_heads / num_kv_heads), matching candle's repeat_kv.
  */
+__device__ __forceinline__ float nexuskv_to_float(float value) { return value; }
+__device__ __forceinline__ float nexuskv_to_float(__half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ void nexuskv_store_float(float* destination, float value) {
+    *destination = value;
+}
+__device__ __forceinline__ void nexuskv_store_float(__half* destination, float value) {
+    *destination = __float2half(value);
+}
+
+template <typename T>
 __global__ void paged_decode_attention_kernel(
-    float* __restrict__ out,
-    const float* __restrict__ q,
-    const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache,
+    T* __restrict__ out,
+    const T* __restrict__ q,
+    const T* __restrict__ k_cache,
+    const T* __restrict__ v_cache,
     const int32_t* __restrict__ block_tables,
     const int32_t* __restrict__ seq_lens,
     const int32_t max_blocks_per_seq,
@@ -58,7 +77,8 @@ __global__ void paged_decode_attention_kernel(
     float* warp_reduce = shared + head_dim;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        q_shared[d] = q[(seq * num_heads + head) * head_dim + d] * scale;
+        q_shared[d] =
+            nexuskv_to_float(q[(seq * num_heads + head) * head_dim + d]) * scale;
     }
     __syncthreads();
 
@@ -80,7 +100,7 @@ __global__ void paged_decode_attention_kernel(
 
         float partial = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            partial += q_shared[d] * k_cache[kv_base + d];
+            partial += q_shared[d] * nexuskv_to_float(k_cache[kv_base + d]);
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             partial += __shfl_down_sync(0xffffffffu, partial, offset);
@@ -104,15 +124,17 @@ __global__ void paged_decode_attention_kernel(
         const float probability = expf(score - new_max);
         denominator = denominator * correction + probability;
         if (out_dim < head_dim) {
-            accumulator = accumulator * correction + probability * v_cache[kv_base + out_dim];
+            accumulator = accumulator * correction +
+                probability * nexuskv_to_float(v_cache[kv_base + out_dim]);
         }
         running_max = new_max;
         __syncthreads();  // warp_reduce[0] is reused next iteration
     }
 
     if (out_dim < head_dim) {
-        out[(seq * num_heads + head) * head_dim + out_dim] =
-            denominator > 0.0f ? accumulator / denominator : 0.0f;
+        nexuskv_store_float(
+            &out[(seq * num_heads + head) * head_dim + out_dim],
+            denominator > 0.0f ? accumulator / denominator : 0.0f);
     }
 }
 
@@ -190,9 +212,52 @@ extern "C" int launch_paged_attention(
     dim3 grid(static_cast<unsigned>(num_seqs), static_cast<unsigned>(num_heads));
     dim3 block(128);
     const size_t shared_bytes = static_cast<size_t>(head_dim + 4) * sizeof(float);
-    paged_decode_attention_kernel<<<grid, block, shared_bytes, 0>>>(
+    paged_decode_attention_kernel<float><<<grid, block, shared_bytes, 0>>>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         max_blocks_per_seq, num_heads, num_kv_heads, head_dim, block_size, scale);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// Half-precision decode on an explicit CUDA stream. `stream` may be null for
+// the default stream; the live path passes candle's device stream so the launch
+// is ordered with q/k/v production and the later output consumption.
+extern "C" int launch_paged_attention_f16(
+    void* out,
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* block_tables,
+    const int32_t* seq_lens,
+    int32_t max_blocks_per_seq,
+    int32_t num_seqs,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    float scale,
+    void* stream)
+{
+    if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        block_tables == nullptr || seq_lens == nullptr) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    if (num_seqs <= 0 || num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > 128 || num_heads % num_kv_heads != 0 || block_size <= 0 ||
+        max_blocks_per_seq <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    dim3 grid(static_cast<unsigned>(num_seqs), static_cast<unsigned>(num_heads));
+    dim3 block(128);
+    const size_t shared_bytes = static_cast<size_t>(head_dim + 4) * sizeof(float);
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    paged_decode_attention_kernel<__half><<<grid, block, shared_bytes, cuda_stream>>>(
+        reinterpret_cast<__half*>(out),
+        reinterpret_cast<const __half*>(q),
+        reinterpret_cast<const __half*>(k_cache),
+        reinterpret_cast<const __half*>(v_cache),
+        block_tables, seq_lens, max_blocks_per_seq, num_heads, num_kv_heads,
+        head_dim, block_size, scale);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
