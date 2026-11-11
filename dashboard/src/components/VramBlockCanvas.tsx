@@ -15,7 +15,7 @@ export interface BlockInspectData {
 interface VramBlockCanvasProps {
     allocatedBlocks: number;
     totalBlocks?: number;
-    acceptanceRate: number;
+    blockSize?: number;
     activeSequenceId?: number;
     activeBlockIds?: number[];
     blocksMetadata?: BlockInspectData[];
@@ -35,7 +35,7 @@ const SEQUENCE_COLORS: string[] = [
 export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
     allocatedBlocks,
     totalBlocks = 512,
-    acceptanceRate,
+    blockSize = 16,
     activeSequenceId,
     activeBlockIds = [],
     blocksMetadata,
@@ -44,6 +44,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
     const containerRef = useRef<HTMLDivElement | null>(null);
 
     const [hoveredBlock, setHoveredBlock] = useState<BlockInspectData | null>(null);
+    const [hoveredBlockId, setHoveredBlockId] = useState<number | null>(null);
     const [selectedBlock, setSelectedBlock] = useState<BlockInspectData | null>(null);
     const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
 
@@ -57,7 +58,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
 
     const cols = 32;
     const rows = Math.ceil(safeTotal / cols);
-    const blockSize = 14;
+    const cellSize = 14;
     const gap = 3;
 
     // Fast lookup set for active blocks
@@ -87,12 +88,12 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
             }
 
             if (blockId < safeAllocated) {
-                return acceptanceRate > 0.8 ? "#10B981" : "#F59E0B";
+                return "#10B981";
             }
 
             return "#1E293B";
         },
-        [safeAllocated, acceptanceRate, activeSequenceId, activeBlockSet]
+        [safeAllocated, activeSequenceId, activeBlockSet]
     );
 
     // Render Canvas
@@ -103,8 +104,8 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         if (!ctx) return;
 
         const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-        const width = cols * (blockSize + gap) - gap;
-        const height = rows * (blockSize + gap) - gap;
+        const width = cols * (cellSize + gap) - gap;
+        const height = rows * (cellSize + gap) - gap;
 
         canvas.width = width * dpr;
         canvas.height = height * dpr;
@@ -117,19 +118,19 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         for (let i = 0; i < safeTotal; i++) {
             const col = i % cols;
             const row = Math.floor(i / cols);
-            const x = col * (blockSize + gap);
-            const y = row * (blockSize + gap);
+            const x = col * (cellSize + gap);
+            const y = row * (cellSize + gap);
 
             const meta = blocksMetadata ? blocksMetadata[i] : undefined;
             const color = getBlockColor(i, meta);
 
             ctx.fillStyle = color;
             ctx.beginPath();
-            ctx.roundRect(x, y, blockSize, blockSize, 2.5);
+            ctx.roundRect(x, y, cellSize, cellSize, 2.5);
             ctx.fill();
 
             // Glow / Stroke if hovered or selected
-            const isHovered = hoveredBlock?.block_id === i;
+            const isHovered = hoveredBlock?.block_id === i || hoveredBlockId === i;
             const isSelected = selectedBlock?.block_id === i;
 
             if (isSelected) {
@@ -145,8 +146,8 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
     }, [
         safeTotal,
         safeAllocated,
-        acceptanceRate,
         hoveredBlock,
+        hoveredBlockId,
         selectedBlock,
         blocksMetadata,
         getBlockColor,
@@ -163,25 +164,15 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
-        const col = Math.floor(mouseX / (blockSize + gap));
-        const row = Math.floor(mouseY / (blockSize + gap));
+        const col = Math.floor(mouseX / (cellSize + gap));
+        const row = Math.floor(mouseY / (cellSize + gap));
 
         if (col >= 0 && col < cols && row >= 0 && row < rows) {
             const blockId = row * cols + col;
             if (blockId < safeTotal) {
-                const isActive = activeBlockSet.has(blockId) || blockId < safeAllocated;
-                const meta = blocksMetadata?.[blockId] ?? {
-                    block_id: blockId,
-                    ref_count: isActive ? 1 : 0,
-                    is_free: !isActive,
-                    mapped_seq_id: isActive
-                        ? activeSequenceId ?? ((blockId % 3) + 1)
-                        : null,
-                    is_prefix_cached: isActive && blockId % 4 === 0,
-                    is_speculative: false,
-                };
-
+                const meta = blocksMetadata?.[blockId] ?? null;
                 setHoveredBlock(meta);
+                setHoveredBlockId(blockId);
 
                 // Ensure tooltip stays within container bounds
                 const posX = Math.min(e.clientX - rect.left + 15, rect.width - 220);
@@ -192,11 +183,13 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
         }
 
         setHoveredBlock(null);
+        setHoveredBlockId(null);
         setTooltipPos(null);
     };
 
     const handleMouseLeave = () => {
         setHoveredBlock(null);
+        setHoveredBlockId(null);
         setTooltipPos(null);
     };
 
@@ -221,7 +214,7 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
                         Physical VRAM Page Map
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                        {safeTotal} Physical Pages @ 16 tokens/block (Non-contiguous CUDA PagedAttention)
+                        {safeTotal} Physical Pages @ {blockSize} tokens/block (paged KV cache)
                     </p>
                 </div>
 
@@ -261,50 +254,64 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
             </div>
 
             {/* Floating Tooltip */}
-            {hoveredBlock && tooltipPos && (
+            {(hoveredBlock || hoveredBlockId !== null) && tooltipPos && (
                 <div
                     style={{ left: `${tooltipPos.x}px`, top: `${tooltipPos.y}px` }}
                     className="pointer-events-none absolute z-30 bg-slate-950/95 border border-slate-700/80 rounded-xl p-3 shadow-2xl backdrop-blur-md text-xs space-y-1 w-52 animate-in fade-in zoom-in-95 duration-100"
                 >
-                    <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
-                        <span className="font-bold text-white font-mono flex items-center gap-1">
-                            <Database className="w-3 h-3 text-emerald-400" />
-                            Block #{hoveredBlock.block_id}
-                        </span>
-                        <span
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${hoveredBlock.is_free
-                                    ? "bg-slate-800 text-slate-400"
-                                    : hoveredBlock.is_prefix_cached
-                                        ? "bg-indigo-950 text-indigo-300 border border-indigo-700/50"
-                                        : "bg-emerald-950 text-emerald-300 border border-emerald-700/50"
-                                }`}
-                        >
-                            {hoveredBlock.is_free
-                                ? "Free Page"
-                                : hoveredBlock.is_prefix_cached
-                                    ? "Prefix Shared"
-                                    : "Active Page"}
-                        </span>
-                    </div>
+                    {hoveredBlock ? (
+                        <>
+                            <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                                <span className="font-bold text-white font-mono flex items-center gap-1">
+                                    <Database className="w-3 h-3 text-emerald-400" />
+                                    Block #{hoveredBlock.block_id}
+                                </span>
+                                <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${hoveredBlock.is_free
+                                            ? "bg-slate-800 text-slate-400"
+                                            : hoveredBlock.is_prefix_cached
+                                                ? "bg-indigo-950 text-indigo-300 border border-indigo-700/50"
+                                                : "bg-emerald-950 text-emerald-300 border border-emerald-700/50"
+                                        }`}
+                                >
+                                    {hoveredBlock.is_free
+                                        ? "Free Page"
+                                        : hoveredBlock.is_prefix_cached
+                                            ? "Trie Cached"
+                                            : "Active Page"}
+                                </span>
+                            </div>
 
-                    <div className="grid grid-cols-2 gap-1 pt-1 text-[11px] text-slate-300">
-                        <span className="text-slate-400">Ref Count:</span>
-                        <span className="font-mono font-bold text-white text-right">
-                            {hoveredBlock.ref_count}
-                        </span>
+                            <div className="grid grid-cols-2 gap-1 pt-1 text-[11px] text-slate-300">
+                                <span className="text-slate-400">Ref Count:</span>
+                                <span className="font-mono font-bold text-white text-right">
+                                    {hoveredBlock.ref_count}
+                                </span>
 
-                        <span className="text-slate-400">Mapped Seq:</span>
-                        <span className="font-mono text-right text-emerald-400">
-                            {hoveredBlock.mapped_seq_id !== null
-                                ? `Seq #${hoveredBlock.mapped_seq_id}`
-                                : "Unmapped"}
-                        </span>
+                                <span className="text-slate-400">Mapped Seq:</span>
+                                <span className="font-mono text-right text-emerald-400">
+                                    {hoveredBlock.mapped_seq_id !== null
+                                        ? `Seq #${hoveredBlock.mapped_seq_id}`
+                                        : "Unmapped"}
+                                </span>
 
-                        <span className="text-slate-400">Speculative:</span>
-                        <span className="font-mono text-right text-amber-400">
-                            {hoveredBlock.is_speculative ? "Drafting" : "Committed"}
-                        </span>
-                    </div>
+                                <span className="text-slate-400">Speculative:</span>
+                                <span className="font-mono text-right text-amber-400">
+                                    {hoveredBlock.is_speculative ? "Drafting" : "Committed"}
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <div className="space-y-1">
+                            <div className="font-bold text-white font-mono">
+                                Block #{hoveredBlockId}
+                            </div>
+                            <div className="text-slate-400">
+                                Block metadata is unavailable. Waiting for live
+                                <code className="font-mono"> /v1/metrics</code> telemetry.
+                            </div>
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -324,7 +331,9 @@ export const VramBlockCanvas: React.FC<VramBlockCanvasProps> = ({
                                     ? "Radix Cached"
                                     : "Active"
                             }`
-                            : "Hover or click any block to inspect VRAM physical page allocation."}
+                            : hoveredBlockId !== null
+                                ? `Block #${hoveredBlockId}: metadata unavailable. Waiting for /v1/metrics telemetry.`
+                                : "Hover or click any block to inspect VRAM physical page allocation."}
                     </span>
                 </div>
 

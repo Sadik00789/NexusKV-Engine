@@ -8,7 +8,15 @@
 ![Axum](https://img.shields.io/badge/Axum-0.7_Async_Web-3B82F6?style=for-the-badge&logo=tokio&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-emerald?style=for-the-badge)
 
-**High-Throughput Paged KV-Cache, Radix Prefix Caching & Speculative Inference Engine in Pure Rust 2024 and Custom CUDA 13.1 Kernels.**
+**Paged KV-Cache, Radix Prefix Caching & Continuous Batching in Rust 2024.**
+
+> **Implementation status.** The default build is CPU-only and starts a
+> deterministic **mock executor**. Mock mode is loudly logged at startup and
+> labeled `"executor": "mock"` in `/v1/models` and `/v1/metrics`; the dashboard
+> shows a MOCK banner. Real Qwen2 inference is behind the `candle-model` feature,
+> and the custom CUDA kernels are behind the `cuda` feature. This repository
+> does **not** claim inference throughput from allocator/bookkeeping
+> microbenchmarks. See [Current status](#-current-status) for details.
 
 </div>
 
@@ -18,10 +26,10 @@
 - [Architectural Overview](#-architectural-overview)
   - [1. PagedAttention Memory Virtualization](#1-pagedattention-memory-virtualization)
   - [2. Radix Tree Prefix Cache](#2-radix-tree-prefix-cache)
-  - [3. Copy-on-Write (CoW) Speculative Tree Decodes](#3-copy-on-write-cow-speculative-tree-decodes)
+  - [3. Copy-on-Write (CoW) Page Rollbacks](#3-copy-on-write-cow-page-rollbacks)
   - [4. Axum Continuous Batching & SSE Pipeline](#4-axum-continuous-batching--sse-pipeline)
 - [Core Features Matrix](#-core-features-matrix)
-- [System Architecture & Benchmarks](#-system-architecture--benchmarks)
+- [Current status](#-current-status)
 - [Prerequisites & Quickstart](#-prerequisites--quickstart)
   - [1. CUDA & Linux / WSL2 Setup](#1-cuda--linux--wsl2-setup)
   - [2. Rust Toolchain (2024 Edition)](#2-rust-toolchain-2024-edition)
@@ -39,7 +47,7 @@
 
 ## 🏛️ Architectural Overview
 
-NexusKV addresses memory fragmentation and lock contention in Large Language Model (LLM) serving by combining virtual memory paging, Trie-based prefix caching, and fine-grained concurrent scheduling.
+NexusKV addresses memory fragmentation and scheduler overhead in LLM serving by combining virtual-memory paging, Trie-based prefix caching, and a single-writer continuous-batching engine actor.
 
 ### 1. PagedAttention Memory Virtualization
 Standard LLM serving pre-allocates contiguous memory buffers for maximum sequence lengths, wasting 60%–80% of VRAM due to internal and external fragmentation. NexusKV divides the Key-Value (KV) cache into non-contiguous physical pages (16 tokens per block) gathered on-the-fly inside thread-local GPU SRAM.
@@ -93,7 +101,8 @@ Incoming sequences sharing common prefixes (e.g., system instructions, few-shot 
 
 ---
 
-### 3. Copy-on-Write (CoW) Speculative Tree Decodes
+### 3. Copy-on-Write (CoW) Page Rollbacks
+Foundation for speculative decoding in phase 4.
 Speculative decoding generates multiple candidate draft tokens in parallel. When a draft branch diverges from target model logits, NexusKV triggers an $O(1)$ page rollback by popping excess block pointers and decrementing physical `ref_count`, completely avoiding expensive $O(N)$ tensor copies.
 
 ```
@@ -104,7 +113,7 @@ Target Logits   : [ Token 100, Token 101, Token 999 (Accepted Correction)   ]
 Rollback Action:
 1. Retain 3 Tokens -> [ 100, 101, 999 ]
 2. Rollback Page Table -> Drop Block #52 back to Free Stack in O(1)
-3. Zero Memory Copies -> 50.88 Million Speculative Tokens/sec
+3. Zero Memory Copies (page-table pointer reclamation)
 ```
 
 ---
@@ -115,27 +124,24 @@ Rollback Action:
  HTTP Requests (OpenAI API / SSE)
                │
                ▼
-┌──────────────────────────────┐
-│ Axum 0.7 Web Routing Layer   │
-└──────────────┬───────────────┘
-               │ (Client Drop Detection via RAII AbortDropGuard)
-               ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ ContinuousScheduler (parking_lot::RwLock)                          │
-│                                                                    │
-│  Waiting Queue:  [ Seq 3 ] ──> Admitted via match_or_allocate_prefix│
-│  Running Pool :  [ Seq 1 (Decode) ] [ Seq 2 (Decode) ]             │
-│  Finished Pool:  [ Seq 0 ]                                         │
+┌────────────────────────────────┐
+│ Axum handlers (no engine locks)│
+└──────────────┬─────────────────┘
+               │ Generate / Abort (mpsc)        ▲ TokenMsg -> SSE
+               ▼                                │
+┌──────────────────────────────────────────────┴─────────────────────┐
+│ Engine actor thread (single writer)                                │
+│  Continuous scheduler · BlockSpaceManager · Executor · Telemetry    │
+│  waiting/running queues · prefix trie · LRU/tiering · rollbacks     │
 └──────────────┬─────────────────────────────────────────────────────┘
-               │
+               │ paged slots / block tables
                ▼
 ┌──────────────────────────────┐       ┌─────────────────────────────┐
-│ PagedAttention CUDA Kernel   │ <===> │ BlockSpaceManager           │
-│ (csrc/paged_attention.cu)    │       │ Physical Allocator + Radix  │
+│ Executor: Mock | Qwen2+CUDA  │ <===> │ Paged KV pools + allocator  │
 └──────────────┬───────────────┘       └─────────────────────────────┘
                │
                ▼
- Server-Sent Events (SSE) Telemetry Stream -> Next.js 15 Canvas Visualizer
+  Snapshot + SSE telemetry -> Next.js dashboard (MOCK banner in mock mode)
 ```
 
 ---
@@ -144,46 +150,37 @@ Rollback Action:
 
 | Feature | Standard Contiguous KV Cache | NexusKV Engine |
 | :--- | :--- | :--- |
-| **Memory Allocation** | Static maximum pre-allocation | **Dynamic Physical Paging (16 tokens/block)** |
-| **VRAM Fragmentation** | 60% – 80% wasted memory | **< 3% (Zero external fragmentation)** |
-| **Prefix Caching** | Duplicate prompt KV computation | **Radix Tree Multi-Tenant Sharing ($O(1)$ CoW)** |
-| **Speculative Rollbacks** | Expensive $O(N)$ GPU `cudaMemcpy` | **Instant $O(1)$ Page Pointer Reclamation** |
-| **Concurrency Locking** | `std::sync::Mutex` decode stalls | **`parking_lot::RwLock` Lock-Free Read Concurrency** |
-| **Client Disconnections** | Memory leaked until sequence end | **RAII `AbortDropGuard` Instant Block Freeing** |
-| **API Compatibility** | Custom proprietary endpoints | **OpenAI Standard (`/v1/chat/completions`)** |
-| **VRAM Observability** | Blind black-box memory | **Interactive 512-Block Next.js 15 Heatmap** |
+| **Memory Allocation** | Static maximum pre-allocation | **Dynamic physical paging (configurable block size)** |
+| **VRAM Fragmentation** | Fixed reservation regardless of use | **Paged allocation without a fixed reservation** |
+| **Prefix Caching** | Duplicate prompt KV computation | **Radix Tree sharing with refcounts** |
+| **Rollbacks** | Rewriting tensors | **Page-table rollback (decode blocks are never trie-inserted)** |
+| **Concurrency Locking** | Cross-thread scheduler locks | **Single-writer engine actor (no hot-path locks)** |
+| **Client Disconnections** | Memory leaked until sequence end | **RAII `AbortDropGuard` sends an actor abort** |
+| **API Compatibility** | Custom proprietary endpoints | **OpenAI-compatible (`/v1/chat/completions`)** |
+| **VRAM Observability** | Blind black-box memory | **Interactive Next.js block heatmap** |
+| **Speculative decoding** | — | **Planned (phase 4); telemetry reports 0.0 until then** |
 
 ---
 
-## 📊 System Architecture & Benchmarks
+## 📊 Current status
 
-Benchmarked on AMD Ryzen / NVIDIA RTX 3050 (Ampere sm_86) & Host CPU:
+- **Phase 1 — memory core:** block state machine (`Free`/`Active`/`Cached`),
+  persistent trie nodes, transactional prefix match/append/fork, copy-on-write
+  partial tails, O(1) free-list guard, LRU eviction (leaf-only in drop mode,
+  any cached block in tier mode), and an injectable `BlockIo` tier interface.
+  `BlockSpaceManager::assert_invariants()` is exercised by deterministic fuzzing
+  and a proptest suite.
+- **Phase 2 — engine:** one actor thread owns the allocator, scheduler, executor
+  and session state. HTTP handlers submit work through channels and relay tokens
+  through SSE. The scheduler performs decodes first, chunks running prefills, and
+  admits waiting sequences while other sequences are decoding (no starvation).
+- **Phase 3 — real inference:** Qwen2 forward pass, tokenizer, paged KV pool, and
+  a correct CPU attention reference live behind `candle-model`. The optimized
+  CUDA decode kernel is behind `cuda` and was compiled only when `nvcc` exists.
 
-```
-================================================================================
-  NexusKV Engine: Physical Paging & Speculative Verification Benchmark Suite   
-================================================================================
-
---- 1. Physical Block Allocator Throughput ---
-  • Allocated & Freed : 65,536 physical blocks (16 tokens/block)
-  • Allocation Time   : 1.454 ms (45.06 Million allocs/sec)
-  • Deallocation Time : 1.039 ms (63.09 Million frees/sec)
-  • Aggregate Rate    : 52.57 Million O(1) Ops/sec
-
---- 2. Radix Tree Prefix Cache Lookups ---
-  • Total Invocations : 100,000 prompt block queries
-  • Trie Hits / Misses: 20.0% hits / 80.0% misses
-  • Average Latency   : 844.22 ns per lookup
-  • Lookup Throughput : 1.18 Million Lookups/sec
-
---- 3. Speculative Verification & O(1) Page Rollback ---
-  • Verified Iterations : 500,000 speculative batches (K = 5)
-  • Tokens Verified     : 2,500,000 candidate tokens
-  • Verification Latency: 98.26 ns / speculative branch
-  • Verification Rate   : 50.88 Million Speculative Tokens/sec
-```
-
----
+No throughput, latency, or acceptance numbers are asserted as project results in
+this README. Any benchmark must identify the hardware, the model, the executor
+mode, and whether it measures bookkeeping or inference.
 
 ## 🛠️ Prerequisites & Quickstart
 
@@ -204,12 +201,19 @@ Ensure you have the latest stable Rust toolchain:
 rustc --version
 cargo --version
 
-# Run test suite
+# Default build: CPU-only, deterministic mock executor, no weights required
 cargo test
-
-# Build and run the engine server
 cargo run --release
+
+# Real Qwen2 inference (CPU or CUDA-backed candle device)
+cargo run --release --features candle-model -- --model /path/to/Qwen2.5-0.5B-Instruct
+
+# Custom CUDA decode kernels (requires nvcc / CUDA toolkit)
+cargo run --release --features cuda -- --model /path/to/Qwen2.5-0.5B-Instruct
 ```
+The model directory must contain `config.json`, `tokenizer.json`, and one
+safetensors shard. Without `--model`, the engine starts in mock mode and labels
+itself as such in the API and dashboard.
 
 ### 3. Telemetry Dashboard (Next.js 15)
 ```bash
@@ -301,47 +305,54 @@ curl -X GET http://127.0.0.1:8080/health
 ## 📂 Directory Structure
 
 ```
-nexuskv-rust/
-├── Cargo.toml                  # Rust 2024 dependencies & crate metadata
-├── build.rs                    # Auto-compiles CUDA .cu kernels via cc & nvcc
-├── README.md                   # System architecture & benchmark documentation
-├── .gitignore                  # Production ignore rules (Rust, CUDA, Next.js)
+nexuskv/
+├── Cargo.toml                  # Rust 2024 features: default | candle-model | cuda
+├── build.rs                    # Compiles the .cu kernel ONLY with feature=cuda
+├── README.md
+├── DECISIONS.md                # Engineering decisions and recorded deviations
+├── LICENSE                     # MIT
 │
-├── csrc/                       # Custom CUDA 13.1 Kernels
-│   └── paged_attention.cu      # PagedAttention block-gather CUDA kernel
+├── csrc/
+│   └── paged_attention.cu      # Online-softmax decode attention + KV kernels
 │
-├── src/                        # Pure Rust Engine Core (Edition 2024)
-│   ├── main.rs                 # Axum web server & CLI entry point
-│   ├── config.rs               # Engine runtime configuration & capacity limits
+├── src/
+│   ├── lib.rs                  # Library target used by integration tests
+│   ├── main.rs                 # CLI (--model) + Axum server entry point
+│   ├── config.rs
 │   ├── memory/
 │   │   ├── mod.rs
-│   │   └── block_manager.rs    # Thread-Safe Physical Block Allocator & Radix Trie
+│   │   ├── block_manager.rs    # States, trie, CoW, LRU, BlockIo, invariants
+│   │   ├── tests.rs            # B1/B2/B5 regressions, rollback/LRU/tier tests
+│   │   └── fuzz.rs             # Deterministic LCG fuzz + proptest
 │   ├── engine/
 │   │   ├── mod.rs
-│   │   ├── scheduler.rs        # Continuous batching iteration scheduler (RwLock)
-│   │   └── speculative.rs      # Speculative tree verification & O(1) page rollbacks
+│   │   ├── actor.rs            # Single-writer engine loop + Snapshot telemetry
+│   │   ├── scheduler.rs        # Decodes-first continuous batching + preemption
+│   │   └── speculative.rs      # Honest acceptance counters (phase 4 adds drafter)
+│   ├── model/
+│   │   ├── mod.rs              # Executor/Tokenizer traits + MockExecutor
+│   │   └── qwen2.rs            # cfg(candle-model): Qwen2 forward, paged KV
 │   ├── kernels/
 │   │   ├── mod.rs
-│   │   └── paged_attention.rs  # Safe FFI wrapper (Rust 2024 `unsafe extern` syntax)
+│   │   └── paged_attention.rs  # CPU softmax oracle + cfg(cuda) FFI
 │   └── server/
 │       ├── mod.rs
-│       └── sse_handler.rs      # OpenAI chat completions & Axum SSE drop guards
+│       ├── routes.rs
+│       └── sse_handler.rs      # OpenAI DTOs, SSE relay, AbortDropGuard
 │
-├── dashboard/                  # Next.js 15 Telemetry & VRAM Visualizer
+├── tests/
+│   ├── api.rs                  # HTTP/SSE/schema/disconnect integration
+│   ├── engine.rs               # actor lifecycle/abort/shared-prefix integration
+│   ├── honesty.rs              # anti-fake build regressions
+│   └── real_model.rs           # #[ignore] weights-required determinism test
+│
+├── dashboard/                  # Next.js 15 telemetry & VRAM visualizer
 │   ├── package.json
-│   ├── next.config.mjs
-│   ├── tailwind.config.js
-│   └── src/
-│       ├── app/
-│       │   ├── layout.tsx
-│       │   └── page.tsx        # Main VRAM Heatmap & Metrics Dashboard
-│       └── components/
-│           ├── VramBlockCanvas.tsx # Interactive HTML5 Canvas with hover inspection
-│           └── MetricsPanel.tsx    # Live TTFT, ITL, Tokens/sec & Alpha rate HUD
+│   └── src/{app,components}/
 │
 └── scripts/
-    ├── build.sh                # Cargo build & CUDA compilation script
-    └── run_benchmarks.rs       # High-throughput benchmark suite
+    ├── sanitize.sh             # compute-sanitizer run for the GPU parity test
+    └── build.sh                # CUDA/WSL build helper
 ```
 
 ---

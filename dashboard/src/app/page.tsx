@@ -9,12 +9,7 @@ import {
     Loader2,
     RefreshCw,
     Terminal,
-    Sparkles,
-    Cpu,
-    CheckCircle2,
-    Layers,
     MessageSquare,
-    Zap,
 } from "lucide-react";
 
 export default function Home() {
@@ -32,11 +27,13 @@ export default function Home() {
     const [itlMs, setItlMs] = useState(0);
     const [allocatedBlocks, setAllocatedBlocks] = useState(0);
     const [totalBlocks, setTotalBlocks] = useState(512);
+    const [blockSize, setBlockSize] = useState(16);
     const [memoryRatio, setMemoryRatio] = useState(0);
-    const [prefixCacheHitRatio, setPrefixCacheHitRatio] = useState(0.42);
-    const [acceptanceRate, setAcceptanceRate] = useState(0.85);
+    const [prefixCacheHitRatio, setPrefixCacheHitRatio] = useState(0);
+    const [acceptanceRate, setAcceptanceRate] = useState(0);
     const [activeBlockIds, setActiveBlockIds] = useState<number[]>([]);
     const [blocksMetadata, setBlocksMetadata] = useState<BlockInspectData[] | undefined>(undefined);
+    const [executor, setExecutor] = useState<string>("unknown");
 
     // Engine connection status
     const [engineOnline, setEngineOnline] = useState(false);
@@ -49,11 +46,15 @@ export default function Home() {
                 if (res.ok) {
                     const data = await res.json();
                     setEngineOnline(true);
+                    setExecutor(data.executor ?? "unknown");
                     setTotalBlocks(data.total_blocks);
+                    if (typeof data.block_size === "number") {
+                        setBlockSize(data.block_size);
+                    }
                     setAllocatedBlocks(data.allocated_blocks);
                     setMemoryRatio(data.memory_usage_percent / 100.0);
-                    setPrefixCacheHitRatio(data.prefix_cache_hit_ratio || 0.45);
-                    setAcceptanceRate(data.speculative_acceptance_rate || 0.85);
+                    setPrefixCacheHitRatio(Number(data.prefix_cache_hit_ratio ?? 0));
+                    setAcceptanceRate(Number(data.speculative_acceptance_rate ?? 0));
                     if (data.block_inspect_info) {
                         setBlocksMetadata(data.block_inspect_info);
                     }
@@ -129,54 +130,11 @@ export default function Home() {
             }
         } catch (err) {
             console.error("Failed to connect to NexusKV engine:", err);
-            // Simulated local playback if backend is offline
-            simulateLocalStream();
+            setEngineOnline(false);
+            setGeneratedText("Engine offline — no telemetry or token stream. Start the NexusKV server on :8080.");
         } finally {
             setIsGenerating(false);
         }
-    };
-
-    const simulateLocalStream = async () => {
-        setIsGenerating(true);
-        setGeneratedText("");
-        const words = [
-            "NexusKV",
-            "executes",
-            "PagedAttention",
-            "with",
-            "lock-free",
-            "continuous",
-            "batching,",
-            "Radix",
-            "prefix",
-            "caching,",
-            "and",
-            "O(1)",
-            "speculative",
-            "tree",
-            "page",
-            "rollbacks",
-            "at",
-            "hardware",
-            "line-rate.",
-        ];
-
-        const seq = (sequenceId ?? 0) + 1;
-        setSequenceId(seq);
-        setTtftMs(18.4);
-
-        for (let i = 0; i < Math.min(words.length, maxTokens); i++) {
-            await new Promise((r) => setTimeout(r, 45));
-            setGeneratedText((prev) => prev + words[i] + " ");
-            setTokensPerSec(58.4 + Math.random() * 4);
-            setItlMs(16.8 + Math.random() * 2);
-            setAllocatedBlocks(Math.min(512, 18 + i * 2));
-            setMemoryRatio((18 + i * 2) / 512);
-            setPrefixCacheHitRatio(0.68);
-            setAcceptanceRate(0.88);
-            setActiveBlockIds(Array.from({ length: 4 + Math.floor(i / 8) }, (_, idx) => idx * 3 + (seq % 4)));
-        }
-        setIsGenerating(false);
     };
 
     return (
@@ -191,11 +149,11 @@ export default function Home() {
                                 NexusKV <span className="text-emerald-400">Engine</span>
                             </h1>
                             <span className="px-2.5 py-0.5 bg-slate-900 border border-slate-700/80 rounded-full text-[11px] font-mono text-emerald-400">
-                                Rust 2024 + CUDA 13.1
+                                Rust 2024 · paged KV
                             </span>
                         </div>
                         <p className="text-xs text-slate-400 mt-1">
-                            High-Throughput Paged KV-Cache, Radix Prefix Caching & Speculative Tree Decodes
+                            Paged KV-Cache, Radix Prefix Caching &amp; Continuous Batching
                         </p>
                     </div>
 
@@ -213,10 +171,20 @@ export default function Home() {
                                     engineOnline ? "bg-emerald-400 animate-ping" : "bg-slate-500"
                                 }`}
                             ></span>
-                            {engineOnline ? "Axum Engine Online (:8080)" : "Standby / Local Simulator"}
+                            {engineOnline ? `Engine Online (:8080) · ${executor}` : "Engine Offline — no telemetry"}
                         </span>
                     </div>
                 </div>
+
+                {executor === "mock" && (
+                    <div className="rounded-xl border border-amber-700/60 bg-amber-950/40 px-4 py-3 text-amber-200 text-sm">
+                        <strong className="font-semibold">MOCK EXECUTOR</strong> — token streams are
+                        synthetic and come from the deterministic mock model. No model weights are
+                        loaded. This mode is labeled <code className="font-mono">executor: mock</code>{" "}
+                        by <code className="font-mono">/v1/metrics</code> and{" "}
+                        <code className="font-mono">/v1/models</code>.
+                    </div>
+                )}
 
                 {/* Real-Time Metrics Panel (HUD) */}
                 <MetricsPanel
@@ -234,7 +202,7 @@ export default function Home() {
                 <VramBlockCanvas
                     allocatedBlocks={allocatedBlocks}
                     totalBlocks={totalBlocks}
-                    acceptanceRate={acceptanceRate}
+                    blockSize={blockSize}
                     activeSequenceId={sequenceId}
                     activeBlockIds={activeBlockIds}
                     blocksMetadata={blocksMetadata}

@@ -38,7 +38,7 @@ export const MetricsPanel: React.FC<MetricsPanelProps> = ({
 
     const safeAlphaPercent = Number.isFinite(acceptanceRate)
         ? (Math.min(1.0, Math.max(0.0, acceptanceRate)) * 100).toFixed(1)
-        : "85.0";
+        : "0.0";
 
     const safeThroughput = Number.isFinite(tokensPerSec) && tokensPerSec >= 0
         ? tokensPerSec.toFixed(1)
