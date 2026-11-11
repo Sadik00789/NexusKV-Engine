@@ -1,0 +1,3 @@
+[build]
+# 8GB host RAM target: candle linking can OOM with the default job count.
+jobs = 2

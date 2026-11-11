@@ -210,4 +210,4 @@ impl Executor for MockExecutor {
 }
 
 #[cfg(feature = "candle-model")]
-pub mod qwen2;
+pub mod qwen;

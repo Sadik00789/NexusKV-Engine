@@ -1,9 +1,19 @@
 // src/main.rs
 use nexuskv::config::EngineConfig;
+use nexuskv::memory::{BlockIo, MemoryBridge, TierStore};
 use nexuskv::server::{AppState, router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const DEFAULT_HOST_BUDGET: usize = 512 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct Cli {
+    model: Option<PathBuf>,
+    swap_dir: Option<PathBuf>,
+    host_budget: usize,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  NexusKV Engine: Rust 2024 Inference Runtime      ");
     tracing::info!("==================================================");
 
+    let cli = parse_args()?;
     let config = EngineConfig::default();
     tracing::info!(
         "Physical KV pool: {} blocks ({} tokens/block)",
@@ -30,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         config.max_seq_token_length()
     );
 
-    let state = build_state(config, parse_model_dir())?;
+    let state = build_state(config, &cli)?;
     tracing::info!(
         "Executor: {} | model: {} | mock: {}",
         state.executor_name,
@@ -42,6 +53,13 @@ async fn main() -> anyhow::Result<()> {
             "=== MOCK MODE: responses are synthetic and labeled executor=mock in the API. ==="
         );
     }
+    if let Some(directory) = &cli.swap_dir {
+        tracing::info!(
+            "Tier store: {} (host budget {} MiB, NVMe spill enabled)",
+            directory.display(),
+            cli.host_budget / (1024 * 1024)
+        );
+    }
 
     let app = router(state);
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -51,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  - Models          : GET  http://{addr}/v1/models");
     tracing::info!("  - Telemetry       : POST http://{addr}/v1/generate/stream");
     tracing::info!("  - Metrics         : GET  http://{addr}/v1/metrics");
+    tracing::info!("  - Sessions        : POST http://{addr}/v1/sessions/commit|checkout|forget");
+    tracing::info!("  - Time travel     : GET  http://{addr}/v1/timetravel?tick=N");
     tracing::info!("  - Health          : GET  http://{addr}/health");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -61,38 +81,83 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_state(config: EngineConfig, model_dir: Option<PathBuf>) -> anyhow::Result<AppState> {
+fn build_state(config: EngineConfig, cli: &Cli) -> anyhow::Result<AppState> {
     #[cfg(feature = "candle-model")]
-    if let Some(directory) = model_dir {
+    if let Some(directory) = &cli.model {
         tracing::info!("Loading real model from {}", directory.display());
         let (executor, tokenizer) =
-            nexuskv::model::qwen2::load_model_and_tokenizer(&directory, &config)?;
-        return Ok(AppState::with_executor(
+            nexuskv::model::qwen::load_model_and_tokenizer(directory, &config)?;
+        let io: Option<Box<dyn BlockIo>> = match &cli.swap_dir {
+            Some(swap_dir) => {
+                let bridge = executor.gpu_bridge();
+                Some(Box::new(
+                    TierStore::new(bridge, swap_dir, cli.host_budget)
+                        .map_err(anyhow::Error::msg)?,
+                ))
+            }
+            None => None,
+        };
+        return Ok(AppState::with_executor_and_io(
             config,
             Box::new(executor),
             tokenizer,
-            "nexuskv-qwen2",
+            "nexuskv-qwen3-0.6b",
+            io,
         ));
     }
 
     #[cfg(not(feature = "candle-model"))]
-    if model_dir.is_some() {
+    if cli.model.is_some() {
         anyhow::bail!(
             "--model requires a build with `--features candle-model` (and weights/config/tokenizer)"
         );
     }
 
-    Ok(AppState::mock(config))
+    let io: Option<Box<dyn BlockIo>> = match &cli.swap_dir {
+        Some(swap_dir) => {
+            let block_bytes = config.block_size * config.num_heads * config.head_dim * 4 * 2;
+            Some(Box::new(
+                TierStore::new(MemoryBridge::new(block_bytes), swap_dir, cli.host_budget)
+                    .map_err(anyhow::Error::msg)?,
+            ))
+        }
+        None => None,
+    };
+    Ok(AppState::mock_with_io(config, io))
 }
 
-fn parse_model_dir() -> Option<PathBuf> {
+fn parse_args() -> anyhow::Result<Cli> {
+    let mut cli = Cli {
+        host_budget: DEFAULT_HOST_BUDGET,
+        ..Cli::default()
+    };
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
-        if argument == "--model" {
-            return arguments.next().map(PathBuf::from);
+        match argument.as_str() {
+            "--model" => {
+                cli.model =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        anyhow::anyhow!("--model requires a directory")
+                    })?));
+            }
+            "--swap-dir" => {
+                cli.swap_dir =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        anyhow::anyhow!("--swap-dir requires a directory")
+                    })?));
+            }
+            "--host-budget" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--host-budget requires a byte count"))?;
+                cli.host_budget = value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("invalid --host-budget {value}: {error}"))?;
+            }
+            other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    None
+    Ok(cli)
 }
 
 async fn shutdown_signal() {

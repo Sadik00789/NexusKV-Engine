@@ -24,14 +24,16 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
+        // RTX 3050 4GB / 8GB RAM target: 192 blocks x 16 tokens is a ~1.5GB
+        // f32 pool (344MB at f16) for Qwen3-0.6B's 28 layers / 8 KV heads.
         Self {
-            total_physical_blocks: 512,
+            total_physical_blocks: 192,
             block_size: 16,
-            num_heads: 8,
-            head_dim: 64,
-            max_num_seqs: 16,
-            max_blocks_per_seq: 32,
-            num_layers: 1,
+            num_heads: 16,
+            head_dim: 128,
+            max_num_seqs: 8,
+            max_blocks_per_seq: 24,
+            num_layers: 28,
             max_num_batched_tokens: 256,
         }
     }

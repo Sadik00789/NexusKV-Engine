@@ -39,6 +39,7 @@ cargo --version
 
 # 3. Compile Rust Engine & CUDA Kernel via Cargo
 echo -e "\n${CYAN}[2/3] Compiling NexusKV Engine Core (Cargo)...${NC}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 cargo build --release
 echo -e "${GREEN}✓ NexusKV Engine Binary built successfully at target/release/nexuskv${NC}"
 

@@ -3,361 +3,402 @@
 <div align="center">
 
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-DEA584?style=for-the-badge&logo=rust&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-13.1_Ampere%2FHopper-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-optional-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![Next.js](https://img.shields.io/badge/Next.js-15.0_App_Router-000000?style=for-the-badge&logo=next.js&logoColor=white)
 ![Axum](https://img.shields.io/badge/Axum-0.7_Async_Web-3B82F6?style=for-the-badge&logo=tokio&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-emerald?style=for-the-badge)
 
-**Paged KV-Cache, Radix Prefix Caching & Continuous Batching in Rust 2024.**
-
-> **Implementation status.** The default build is CPU-only and starts a
-> deterministic **mock executor**. Mock mode is loudly logged at startup and
-> labeled `"executor": "mock"` in `/v1/models` and `/v1/metrics`; the dashboard
-> shows a MOCK banner. Real Qwen2 inference is behind the `candle-model` feature,
-> and the custom CUDA kernels are behind the `cuda` feature. This repository
-> does **not** claim inference throughput from allocator/bookkeeping
-> microbenchmarks. See [Current status](#-current-status) for details.
+**Paged KV-Cache, Radix Prefix Caching, Continuous Batching, Speculative Decoding,
+Git-for-KV Sessions, Time Travel, and Tiered KV Memory — in Rust 2024.**
 
 </div>
 
----
-
-## 📖 Table of Contents
-- [Architectural Overview](#-architectural-overview)
-  - [1. PagedAttention Memory Virtualization](#1-pagedattention-memory-virtualization)
-  - [2. Radix Tree Prefix Cache](#2-radix-tree-prefix-cache)
-  - [3. Copy-on-Write (CoW) Page Rollbacks](#3-copy-on-write-cow-page-rollbacks)
-  - [4. Axum Continuous Batching & SSE Pipeline](#4-axum-continuous-batching--sse-pipeline)
-- [Core Features Matrix](#-core-features-matrix)
-- [Current status](#-current-status)
-- [Prerequisites & Quickstart](#-prerequisites--quickstart)
-  - [1. CUDA & Linux / WSL2 Setup](#1-cuda--linux--wsl2-setup)
-  - [2. Rust Toolchain (2024 Edition)](#2-rust-toolchain-2024-edition)
-  - [3. Telemetry Dashboard (Next.js 15)](#3-telemetry-dashboard-nextjs-15)
-- [API Reference & `curl` Examples](#-api-reference--curl-examples)
-  - [OpenAI Chat Completions (`POST /v1/chat/completions`)](#openai-chat-completions-post-v1chatcompletions)
-  - [Engine Telemetry Stream (`POST /v1/generate/stream`)](#engine-telemetry-stream-post-v1generatestream)
-  - [Model Metadata (`GET /v1/models`)](#model-metadata-get-v1models)
-  - [System Metrics (`GET /v1/metrics`)](#system-metrics-get-v1metrics)
-  - [Health Probe (`GET /health`)](#health-probe-get-health)
-- [Directory Structure](#-directory-structure)
-- [License](#-license)
+> **Honesty notice.** The default `cargo run` starts a deterministic **mock
+> executor**. Mock mode is loudly logged at startup, reports
+> `"executor": "mock"` from `/v1/models` and `/v1/metrics`, and the dashboard
+> shows a MOCK banner. Real dense Qwen inference lives behind the
+> `candle-model` feature; the custom CUDA kernel lives behind `cuda`. This
+> README does not claim inference throughput from allocator microbenchmarks or
+> mock-mode token rates. Every benchmark must name its hardware, model, executor
+> mode, and what it measures.
 
 ---
 
-## 🏛️ Architectural Overview
+## 📸 Screenshots
 
-NexusKV addresses memory fragmentation and scheduler overhead in LLM serving by combining virtual-memory paging, Trie-based prefix caching, and a single-writer continuous-batching engine actor.
+Live dashboard (mock executor, explicitly labeled):
 
-### 1. PagedAttention Memory Virtualization
-Standard LLM serving pre-allocates contiguous memory buffers for maximum sequence lengths, wasting 60%–80% of VRAM due to internal and external fragmentation. NexusKV divides the Key-Value (KV) cache into non-contiguous physical pages (16 tokens per block) gathered on-the-fly inside thread-local GPU SRAM.
+![NexusKV live dashboard](docs/dashboard-live.png)
 
-```
-Logical Sequence 1 (Tokens 0..47)
-┌──────────────────────┬──────────────────────┬──────────────────────┐
-│  Logical Block 0     │  Logical Block 1     │  Logical Block 2     │
-│  [Tokens 00..15]     │  [Tokens 16..31]     │  [Tokens 32..47]     │
-└──────────┬───────────┴──────────┬───────────┴──────────┬───────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-┌────────────────────────────────────────────────────────────────────┐
-│ Sequence Page Table (Seq #1)                                       │
-│ [ Logical Block 0 -> Phys #12 ]                                    │
-│ [ Logical Block 1 -> Phys #04 ]                                    │
-│ [ Logical Block 2 -> Phys #89 ]                                    │
-└────────────────────────────────────────────────────────────────────┘
-           │                      │                      │
-           ▼                      ▼                      ▼
-Physical GPU VRAM Pool (512 Physical Blocks @ 16 tokens/block)
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│ Block 04 │ │ Block 12 │ │ Block 89 │ │ Block 02 │ │ Block 15 │
-│ (Seq #1) │ │ (Seq #1) │ │ (Seq #1) │ │ (Free)   │ │ (Seq #2) │
-└──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘
-```
+Time-travel replay driven by flight-recorder keyframes and memory events:
+
+![NexusKV time-travel dashboard](docs/dashboard-time-travel.png)
 
 ---
 
-### 2. Radix Tree Prefix Cache
-Incoming sequences sharing common prefixes (e.g., system instructions, few-shot examples, multi-turn dialogues) are matched against a Radix Trie node index. Shared token chunks increment the physical block's `ref_count` without duplicate allocations or GPU memory copies.
+## 🧭 Current status
 
-```
-                       [ Radix Trie Root ]
-                                │
-                 Token Chunk: "System: You are an AI..."
-                                │
-                      [ Physical Block #08 ] (ref_count = 3)
-                                ├───┬───┐
-                ┌───────────────┘   │   └───────────────┐
-   User A: "Summarize..."           │      User C: "Translate..."
-                │                   │                   │
-      [ Phys Block #24 ]            │         [ Phys Block #67 ]
-      (ref_count = 1)               │         (ref_count = 1)
-                                    │
-                         User B: "Explain..."
-                                    │
-                          [ Phys Block #41 ]
-                          (ref_count = 1)
-```
+| Area | State |
+| --- | --- |
+| Memory core | `Free`/`Active`/`Cached` state machine, radix trie, transactional prefix match/append/fork, copy-on-write tails, O(1) free-list guard, LRU eviction, pinned commits |
+| Engine | Single-writer actor, continuous batching, chunked prefill, decodes-first scheduling, starvation-free admission, preemption |
+| Serving | OpenAI-compatible chat, SSE generation, measured TTFT/ITL/tok-s, client-disconnect aborts |
+| Speculative decoding | Prompt-lookup n-gram drafter, distribution-exact rejection sampling, greedy verification, UCB1 adaptive `K` over `{0,2,4,8,16}` |
+| Sessions | Commit pins full-block KV prefixes, checkout resumes in O(1) and branches independently, forget unpins |
+| Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, `GET /v1/timetravel?tick=N` |
+| Tiering | Content-addressed host LRU + NVMe spill, demand page-in on `Swapped` trie hits, fault-injection coverage |
+| Real model | Dense Qwen3-0.6B (primary) / Qwen2.5-0.5B-Instruct fallback behind `candle-model`; QK-norm, GQA, RoPE, SwiGLU, paged gather attention |
+| CUDA | `paged_decode_attention` with online softmax, `reshape_and_cache`, `copy_block`; GPU parity tests are `#[ignore]`d because this build machine has no NVIDIA GPU/nvcc |
+| Default build | CPU-only, no GPU, no CUDA toolkit, no model weights, all tests green |
 
----
+### Target hardware and defaults
 
-### 3. Copy-on-Write (CoW) Page Rollbacks
-Foundation for speculative decoding in phase 4.
-Speculative decoding generates multiple candidate draft tokens in parallel. When a draft branch diverges from target model logits, NexusKV triggers an $O(1)$ page rollback by popping excess block pointers and decrementing physical `ref_count`, completely avoiding expensive $O(N)$ tensor copies.
+The default engine configuration targets an **RTX 3050 4GB + 8GB system RAM
+(WSL2)** host:
 
-```
-Target Verification:
-Draft Candidates: [ Token 100, Token 101, Token 102 (Divergence!), Token 103 ]
-Target Logits   : [ Token 100, Token 101, Token 999 (Accepted Correction)   ]
+- `total_physical_blocks = 192`
+- `block_size = 16`
+- `max_num_seqs = 8`
+- `max_blocks_per_seq = 24`
+- KV pool ≈ 344 MB at f16 (the current candle path stores f32; see limitations)
+- Tier host budget defaults to `512 MiB`
 
-Rollback Action:
-1. Retain 3 Tokens -> [ 100, 101, 999 ]
-2. Rollback Page Table -> Drop Block #52 back to Free Stack in O(1)
-3. Zero Memory Copies (page-table pointer reclamation)
-```
+Builds on 8GB hosts should use `CARGO_BUILD_JOBS=2` (also set in
+`.cargo/config.toml`) to avoid OOM while linking candle.
 
 ---
 
-### 4. Axum Continuous Batching & SSE Pipeline
+## 🏛️ Architecture
 
 ```
- HTTP Requests (OpenAI API / SSE)
-               │
-               ▼
-┌────────────────────────────────┐
-│ Axum handlers (no engine locks)│
-└──────────────┬─────────────────┘
-               │ Generate / Abort (mpsc)        ▲ TokenMsg -> SSE
-               ▼                                │
-┌──────────────────────────────────────────────┴─────────────────────┐
-│ Engine actor thread (single writer)                                │
-│  Continuous scheduler · BlockSpaceManager · Executor · Telemetry    │
-│  waiting/running queues · prefix trie · LRU/tiering · rollbacks     │
-└──────────────┬─────────────────────────────────────────────────────┘
-               │ paged slots / block tables
-               ▼
-┌──────────────────────────────┐       ┌─────────────────────────────┐
-│ Executor: Mock | Qwen2+CUDA  │ <===> │ Paged KV pools + allocator  │
-└──────────────┬───────────────┘       └─────────────────────────────┘
-               │
-               ▼
-  Snapshot + SSE telemetry -> Next.js dashboard (MOCK banner in mock mode)
+ HTTP / SSE (Axum)
+        │  Generate · Abort · Commit · Checkout · Forget · SessionTree
+        ▼                              ▲ TokenMsg → SSE
+ ┌────────────────────────────────────┴──────────────────────────────┐
+ │ Engine actor thread (single writer)                               │
+ │  Scheduler · BlockSpaceManager · Executor · SessionStore          │
+ │  LookupDrafter · AdaptiveK bandit · FlightRecorder keyframes      │
+ └──────────────┬───────────────────────────────┬────────────────────┘
+                │ paged slots / block tables     │ non-blocking MemEvents
+                ▼                                ▼
+ ┌──────────────────────────────┐      ┌──────────────────────────────┐
+ │ Executor                      │      │ FlightRecorder               │
+ │  Mock | Qwen dense (candle)   │      │  50k-event ring buffer       │
+ │  Paged K/V pools              │      │  keyframes ≤256 ticks apart  │
+ └──────────────┬───────────────┘      └──────────────────────────────┘
+                │ GpuBridge (f32 block bytes)
+                ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ TierStore: content-addressed host LRU → NVMe {hash}.kv           │
+ └──────────────────────────────────────────────────────────────────┘
 ```
+
+### 1. Paged KV memory
+
+Physical blocks move through `Free → Active → Cached → Free` with explicit
+refcounts, pins, and an O(1) free-list guard. Cached blocks are never on the
+free stack. Prefix matching, appends, forks, rollbacks, and CoW are
+transactional: a late OOM undoes every acquisition. Tests assert a full
+invariant set after every operation, including deterministic fuzzing and
+proptest.
+
+### 2. Continuous batching actor
+
+One engine thread owns the allocator, scheduler, executor, and sessions.
+HTTP handlers submit channel requests and relay per-sequence token channels.
+The scheduler runs decodes first, chunks running prefills, and admits waiting
+sequences while others are decoding, so a long-running decode cannot starve
+new work. Admission OOM preempts the newest non-progressing sequence and
+requeues it.
+
+### 3. Speculative decoding
+
+- `LookupDrafter` indexes 3-grams over prompt + committed output and proposes
+  the continuation after the most recent suffix match.
+- For one-hot draft distributions, rejection sampling is distribution-exact:
+  accept with `p_target(draft)`, otherwise sample a correction from the target
+  with the draft token removed and stop the chain. All accepted drafts earn one
+  bonus token.
+- Temperature < 1e-3 switches to greedy verification.
+- `AdaptiveK` is a UCB1 bandit over `{0,2,4,8,16}` with reward
+  `accepted_tokens / verification_ms`.
+
+### 4. Git-for-KV sessions and time travel
+
+`POST /v1/sessions/commit` pins the sequence's full blocks and stores its token
+history. `POST /v1/sessions/checkout` attaches the pinned prefix with O(1)
+refcount bumps and re-prefills only the partial tail. `POST
+/v1/sessions/forget` releases the pins. Pinned blocks are never evictable.
+
+Every allocator event is recorded in a bounded flight recorder. Full allocator
+keyframes are kept at most 256 ticks apart, so `GET /v1/timetravel?tick=N`
+returns a keyframe plus the exact event suffix to replay. The dashboard
+applies the same reducer client-side and never fabricates offline state.
+
+### 5. Tiered KV
+
+`TierStore` implements the allocator's `BlockIo` trait, content-addressed by the
+trie hash. Eviction reads a block through `GpuBridge`, keeps it in a
+byte-budgeted host LRU, and spills the oldest entries to
+`{swap-dir}/{hash:016x}.kv`. A `Swapped` trie hit allocates a block, pages the
+bytes back in, and increments `page_faults`. Missing or corrupt files are loud
+errors; save failures fall back to safe leaf drops or the next candidate.
 
 ---
 
-## 🚀 Core Features Matrix
+## 🚀 Quickstart
 
-| Feature | Standard Contiguous KV Cache | NexusKV Engine |
-| :--- | :--- | :--- |
-| **Memory Allocation** | Static maximum pre-allocation | **Dynamic physical paging (configurable block size)** |
-| **VRAM Fragmentation** | Fixed reservation regardless of use | **Paged allocation without a fixed reservation** |
-| **Prefix Caching** | Duplicate prompt KV computation | **Radix Tree sharing with refcounts** |
-| **Rollbacks** | Rewriting tensors | **Page-table rollback (decode blocks are never trie-inserted)** |
-| **Concurrency Locking** | Cross-thread scheduler locks | **Single-writer engine actor (no hot-path locks)** |
-| **Client Disconnections** | Memory leaked until sequence end | **RAII `AbortDropGuard` sends an actor abort** |
-| **API Compatibility** | Custom proprietary endpoints | **OpenAI-compatible (`/v1/chat/completions`)** |
-| **VRAM Observability** | Blind black-box memory | **Interactive Next.js block heatmap** |
-| **Speculative decoding** | — | **Planned (phase 4); telemetry reports 0.0 until then** |
+### Mock mode (no GPU, no weights)
 
----
-
-## 📊 Current status
-
-- **Phase 1 — memory core:** block state machine (`Free`/`Active`/`Cached`),
-  persistent trie nodes, transactional prefix match/append/fork, copy-on-write
-  partial tails, O(1) free-list guard, LRU eviction (leaf-only in drop mode,
-  any cached block in tier mode), and an injectable `BlockIo` tier interface.
-  `BlockSpaceManager::assert_invariants()` is exercised by deterministic fuzzing
-  and a proptest suite.
-- **Phase 2 — engine:** one actor thread owns the allocator, scheduler, executor
-  and session state. HTTP handlers submit work through channels and relay tokens
-  through SSE. The scheduler performs decodes first, chunks running prefills, and
-  admits waiting sequences while other sequences are decoding (no starvation).
-- **Phase 3 — real inference:** Qwen2 forward pass, tokenizer, paged KV pool, and
-  a correct CPU attention reference live behind `candle-model`. The optimized
-  CUDA decode kernel is behind `cuda` and was compiled only when `nvcc` exists.
-
-No throughput, latency, or acceptance numbers are asserted as project results in
-this README. Any benchmark must identify the hardware, the model, the executor
-mode, and whether it measures bookkeeping or inference.
-
-## 🛠️ Prerequisites & Quickstart
-
-### 1. CUDA & Linux / WSL2 Setup
-- NVIDIA GPU (Ampere, Ada Lovelace, Hopper, or Blackwell).
-- NVIDIA Driver $\ge 535.x$ and CUDA Toolkit 12.x or 13.x.
-- Set your `CUDA_HOME`:
-  ```bash
-  export CUDA_HOME=/usr/local/cuda-13.1  # or /usr/local/cuda
-  export PATH=$CUDA_HOME/bin:$PATH
-  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-  ```
-
-### 2. Rust Toolchain (2024 Edition)
-Ensure you have the latest stable Rust toolchain:
 ```bash
-# Verify Rust 2024 Edition compatibility
-rustc --version
-cargo --version
-
-# Default build: CPU-only, deterministic mock executor, no weights required
 cargo test
 cargo run --release
-
-# Real Qwen2 inference (CPU or CUDA-backed candle device)
-cargo run --release --features candle-model -- --model /path/to/Qwen2.5-0.5B-Instruct
-
-# Custom CUDA decode kernels (requires nvcc / CUDA toolkit)
-cargo run --release --features cuda -- --model /path/to/Qwen2.5-0.5B-Instruct
+# POST http://127.0.0.1:8080/v1/generate/stream
+# Dashboard: http://localhost:3000
 ```
-The model directory must contain `config.json`, `tokenizer.json`, and one
-safetensors shard. Without `--model`, the engine starts in mock mode and labels
-itself as such in the API and dashboard.
 
-### 3. Telemetry Dashboard (Next.js 15)
+Mock mode is deterministic and labeled. It is useful for memory/scheduler/
+session tests and never presented as model inference.
+
+### Real dense Qwen inference
+
+```bash
+# Primary target: Qwen/Qwen3-0.6B (dense, 28 layers, 8 KV heads, head_dim 128)
+# Fallback: Qwen/Qwen2.5-0.5B-Instruct
+export CARGO_BUILD_JOBS=2
+cargo run --release --features candle-model -- --model /path/to/Qwen3-0.6B
+```
+
+The model directory must contain `config.json`, `tokenizer.json`, and at least
+one `*.safetensors` shard. Split checkpoints are loaded one shard at a time; a
+single-shard checkpoint takes the low-overhead mmap path. Qwen3 QK-norm tensors
+are detected and applied before RoPE; Qwen2 checkpoints use the same code path
+without them. Qwen3.5/3.6/3.8 Gated DeltaNet hybrid architectures are rejected
+with an explicit error.
+
+### CUDA decode kernel
+
+```bash
+# Requires nvcc and an NVIDIA GPU (sm_86 SASS + compute_86 PTX emitted)
+cargo run --release --features cuda -- --model /path/to/Qwen3-0.6B
+```
+
+The correct CPU softmax reference is always available and tested without a GPU.
+CUDA parity and compute-sanitizer tests carry `#[ignore]` with hardware notes.
+
+### Tiered KV (host + NVMe)
+
+```bash
+cargo run --release --features candle-model -- \
+  --model /path/to/Qwen3-0.6B \
+  --swap-dir /var/tmp/nexuskv-kv \
+  --host-budget 536870912
+```
+
+`--host-budget` is in bytes (default `512 MiB`). In mock mode the paging
+machinery is real but the block bytes are synthetic; startup logs a warning.
+
+### Dashboard
+
 ```bash
 cd dashboard
-
-# Install dependencies with pnpm
 pnpm install
-
-# Start Next.js 15 dev server
-pnpm dev
-
-# Or compile optimized production build
-pnpm build && pnpm start
+pnpm dev          # development
+pnpm build        # production build
+pnpm typecheck
+pnpm test         # replay reducer tests
 ```
-Open **http://localhost:3000** in your browser.
+
+The dashboard defaults to live telemetry, adds a time-travel scrubber, and
+shows commit/checkout/forget controls with a session branch tree. If the engine
+is offline it says so; it does not simulate playback.
 
 ---
 
-## 🔌 API Reference & `curl` Examples
+## 🔌 API
 
-### OpenAI Chat Completions (`POST /v1/chat/completions`)
+### OpenAI Chat Completions
 
-#### A. Streaming Request (`stream: true`):
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "nexuskv-engine-v1",
-    "messages": [
-      {"role": "system", "content": "You are NexusKV, an ultra-fast inference assistant."},
-      {"role": "user", "content": "Explain PagedAttention memory pooling."}
-    ],
-    "max_tokens": 32,
+    "messages": [{"role": "user", "content": "Explain paged attention."}],
+    "max_tokens": 64,
     "temperature": 0.7,
     "stream": true
   }'
 ```
 
-#### B. Non-Streaming Request (`stream: false`):
-```bash
-curl -X POST http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "nexuskv-engine-v1",
-    "messages": [
-      {"role": "user", "content": "How does Radix prefix caching eliminate prefill duplicate work?"}
-    ],
-    "max_tokens": 48,
-    "stream": false
-  }'
-```
+Streaming ends with `[DONE]`; non-streaming returns OpenAI `usage`. Existing
+DTO shapes are preserved; new fields are additive.
 
----
+### Engine stream with speculative decoding
 
-### Engine Telemetry Stream (`POST /v1/generate/stream`)
-Streams real-time physical VRAM block IDs, TTFT, ITL, and speculative acceptance metrics:
 ```bash
 curl -N -X POST http://127.0.0.1:8080/v1/generate/stream \
   -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Continuous batching decode iteration",
-    "max_tokens": 32
-  }'
+  -d '{"prompt": "Explain continuous batching", "max_tokens": 64, "spec": true}'
 ```
 
----
+Each SSE event carries measured `ttft_ms`, `itl_ms`, `tokens_per_sec`,
+`event_tick`, physical block ids, acceptance, and adaptive `K`.
 
-### Model Metadata (`GET /v1/models`)
+### Sessions
+
 ```bash
-curl -X GET http://127.0.0.1:8080/v1/models
+# Commit a live sequence (seq comes from the SSE telemetry)
+curl -X POST http://127.0.0.1:8080/v1/sessions/commit \
+  -H "Content-Type: application/json" \
+  -d '{"session":"main","label":"root","seq":7}'
+
+# Checkout a commit (SSE token stream, same telemetry schema)
+curl -N -X POST http://127.0.0.1:8080/v1/sessions/checkout \
+  -H "Content-Type: application/json" \
+  -d '{"node":1,"max_tokens":64,"temperature":0.7,"spec":true}'
+
+# Unpin and forget
+curl -X POST http://127.0.0.1:8080/v1/sessions/forget \
+  -H "Content-Type: application/json" -d '{"node":1}'
+
+# Branch tree
+curl http://127.0.0.1:8080/v1/sessions/main/tree
 ```
 
----
+### Time travel and telemetry
 
-### System Metrics (`GET /v1/metrics`)
 ```bash
-curl -X GET http://127.0.0.1:8080/v1/metrics
+curl 'http://127.0.0.1:8080/v1/timetravel?tick=256'
+curl http://127.0.0.1:8080/v1/metrics
+curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8080/health
 ```
+
+`/v1/metrics` includes `event_tick`, live/cached/free block counts, prefix hit
+ratio, acceptance, adaptive `K`, evictions, page faults, CoW copies, preemptions,
+and tier counters (`swapped_out`, `swapped_in`, `disk_spills`, `disk_loads`).
 
 ---
 
-### Health Probe (`GET /health`)
+## 📊 Benchmarks that stay honest
+
+Two tools, with different meanings:
+
+**Bookkeeping only** (allocator, trie, rollback; no model, no tokens):
+
 ```bash
-curl -X GET http://127.0.0.1:8080/health
+cargo bench --bench bookkeeping
 ```
+
+The benchmark prints `BOOKKEEPING THROUGHPUT — NOT INFERENCE`. Criterion results
+must never be quoted as serving throughput.
+
+**End-to-end serving** (real concurrent SSE clients, real measured tokens):
+
+```bash
+python3 scripts/bench_e2e.py \
+  --url http://127.0.0.1:8080 \
+  --clients 8 --max-tokens 128 --spec
+```
+
+The script reports aggregate tok/s, TTFT p50/p99, ITL p50/p99, per-client
+throughput, prefix hit rate, acceptance, adaptive K, evictions, page faults, and
+tier counters. `--compare` prints the same-GPU/same-model llama.cpp comparison
+protocol; it does not assert a result on its own.
+
+No throughput, latency, or acceptance number is presented as a project result
+in this README. Mock-mode token rates measure bookkeeping and transport only.
 
 ---
 
-## 📂 Directory Structure
+## 🧪 Testing
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test                       # no GPU, no weights required
+cargo test --features candle-model
+cd dashboard && pnpm typecheck && pnpm test && pnpm build
+```
+
+Coverage highlights:
+
+- B1/B2/B5 regressions, LRU/CoW/rollback units, 8×8000 deterministic fuzz runs,
+  12k-op pressure runs, and proptest refcount conservation.
+- Scheduler starvation/preemption units and actor lifecycle/abort/shared-prefix
+  integration.
+- HTTP/SSE/OpenAI schema, client disconnect, session commit/checkout/forget,
+  and time-travel replay determinism.
+- Rejection-sampling statistics (400k seeded draws), greedy spec-on/off
+  equivalence over 20 prompts, bandit convergence, and speculative KV
+  accounting under OOM.
+- Tier roundtrip, host budget spill, disk/missing/corrupt-file behavior,
+  failure-injection fuzz, and an 8-block demand-paging e2e.
+- Anti-fake build regressions: no canned vocabularies, pacing sleeps, `0.85`
+  acceptance defaults, or dashboard playback simulations.
+
+GPU tests are the only `#[ignore]`d tests; each carries a hardware comment and
+is run with `scripts/sanitize.sh` on a CUDA machine.
+
+---
+
+## 📂 Directory structure
 
 ```
 nexuskv/
-├── Cargo.toml                  # Rust 2024 features: default | candle-model | cuda
-├── build.rs                    # Compiles the .cu kernel ONLY with feature=cuda
-├── README.md
-├── DECISIONS.md                # Engineering decisions and recorded deviations
+├── Cargo.toml                  # default | candle-model | cuda
+├── build.rs                    # compiles .cu only with feature=cuda
+├── DECISIONS.md                # engineering decisions + recorded deviations
 ├── LICENSE                     # MIT
-│
 ├── csrc/
-│   └── paged_attention.cu      # Online-softmax decode attention + KV kernels
-│
+│   └── paged_attention.cu      # online-softmax decode + KV kernels
 ├── src/
-│   ├── lib.rs                  # Library target used by integration tests
-│   ├── main.rs                 # CLI (--model) + Axum server entry point
 │   ├── config.rs
 │   ├── memory/
-│   │   ├── mod.rs
-│   │   ├── block_manager.rs    # States, trie, CoW, LRU, BlockIo, invariants
-│   │   ├── tests.rs            # B1/B2/B5 regressions, rollback/LRU/tier tests
-│   │   └── fuzz.rs             # Deterministic LCG fuzz + proptest
+│   │   ├── block_manager.rs    # states, trie, CoW, LRU, BlockIo, invariants
+│   │   ├── events.rs           # FlightRecorder keyframes + replay reducer
+│   │   ├── tier.rs             # TierStore, GpuBridge, host/NVMe tiering
+│   │   ├── tests.rs
+│   │   └── fuzz.rs
 │   ├── engine/
-│   │   ├── mod.rs
-│   │   ├── actor.rs            # Single-writer engine loop + Snapshot telemetry
-│   │   ├── scheduler.rs        # Decodes-first continuous batching + preemption
-│   │   └── speculative.rs      # Honest acceptance counters (phase 4 adds drafter)
+│   │   ├── actor.rs            # single-writer loop + Snapshot telemetry
+│   │   ├── scheduler.rs        # continuous batching + preemption
+│   │   ├── speculative.rs      # drafter, rejection sampling, AdaptiveK
+│   │   └── session.rs          # commit/checkout/forget branch store
 │   ├── model/
-│   │   ├── mod.rs              # Executor/Tokenizer traits + MockExecutor
-│   │   └── qwen2.rs            # cfg(candle-model): Qwen2 forward, paged KV
-│   ├── kernels/
-│   │   ├── mod.rs
-│   │   └── paged_attention.rs  # CPU softmax oracle + cfg(cuda) FFI
-│   └── server/
-│       ├── mod.rs
-│       ├── routes.rs
-│       └── sse_handler.rs      # OpenAI DTOs, SSE relay, AbortDropGuard
-│
-├── tests/
-│   ├── api.rs                  # HTTP/SSE/schema/disconnect integration
-│   ├── engine.rs               # actor lifecycle/abort/shared-prefix integration
-│   ├── honesty.rs              # anti-fake build regressions
-│   └── real_model.rs           # #[ignore] weights-required determinism test
-│
-├── dashboard/                  # Next.js 15 telemetry & VRAM visualizer
-│   ├── package.json
-│   └── src/{app,components}/
-│
-└── scripts/
-    ├── sanitize.sh             # compute-sanitizer run for the GPU parity test
-    └── build.sh                # CUDA/WSL build helper
+│   │   ├── mod.rs              # Executor/Tokenizer + MockExecutor
+│   │   └── qwen.rs             # cfg(candle-model): dense Qwen3/Qwen2
+│   ├── kernels/paged_attention.rs
+│   └── server/{routes.rs,sse_handler.rs}
+├── tests/{api,engine,sessions,speculative,tiering,honesty,bench_smoke}.rs
+├── benches/bookkeeping.rs
+├── scripts/{bench_e2e.py,sanitize.sh,build.sh}
+└── dashboard/                  # Next.js 15 telemetry / time-travel UI
 ```
+
+---
+
+## ⚠️ Known limitations
+
+- The custom CUDA kernel is parity-tested against the CPU oracle but is not yet
+  wired to candle's persistent pool tensors; the candle path uses gather
+  attention on the selected device. This is recorded in `DECISIONS.md`.
+- Weights load as f32, so memory use is higher than an f16 deployment. The tier
+  bridge also uses an f32 byte container; raw device-to-host copies and dtype-
+  aware serialization are the documented optimization path.
+- v1 recomputes prefill even on resident trie hits. Hits save memory, not
+  compute yet; the code carries `// TODO(kv-valid)` at the exact spot.
+- A single sequence cannot exceed the resident block pool: active blocks are not
+  evictable. The 8-block/200-token tiering e2e completes 200 tokens across
+  sequences with a shared prefix, forcing swap-out/page-in between rounds.
+- Mock tiering stores synthetic block bytes; the paging machinery is real and
+  labeled at startup.
+- The Qwen3.5/3.6/3.8 hybrid architectures are rejected; only dense Qwen3/Qwen2
+  checkpoints are supported.
 
 ---
 
 ## 📄 License
+
 Licensed under the [MIT License](LICENSE).
-<img width="1920" height="1080" alt="Screenshot 2026-08-14 132320" src="https://github.com/user-attachments/assets/36f2a1f2-02d5-49c9-bd20-65ad551dd931" />
-<img width="1920" height="1080" alt="Screenshot 2026-08-14 173607" src="https://github.com/user-attachments/assets/3da908e9-9e82-4962-b6dc-01b0d1020f5e" />

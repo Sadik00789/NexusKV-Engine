@@ -45,8 +45,13 @@ candle-nn = { version = "0.9", optional = true }
 tokenizers = { version = "0.21", optional = true }
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1.5"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+
+[[bench]]
+name = "bookkeeping"
+harness = false
 
 [build-dependencies]
 cc = { version = "1.2", features = ["parallel"] }

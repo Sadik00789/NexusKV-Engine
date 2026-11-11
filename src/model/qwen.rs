@@ -1,13 +1,14 @@
-// src/model/qwen2.rs
+// src/model/qwen.rs
 use super::{Executor, ModelError, Tokenizer};
 use crate::config::EngineConfig;
-use crate::memory::{BlockSpaceManager, SeqId};
+use crate::memory::tier::GpuBridge;
+use crate::memory::{BlockId, BlockSpaceManager, SeqId};
 use candle_core::{D, DType, Device, Module, Result as CandleResult, Tensor};
 use candle_nn::{Embedding, Linear, VarBuilder as NnVarBuilder, embedding};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Deserialize)]
 struct HfConfig {
@@ -111,6 +112,33 @@ fn read_hf_config(directory: &Path) -> anyhow::Result<HfConfig> {
     let raw: serde_json::Value = serde_json::from_slice(
         &fs::read(&path).map_err(|err| anyhow::anyhow!("cannot read {}: {err}", path.display()))?,
     )?;
+    if let Some(model_type) = raw.get("model_type").and_then(serde_json::Value::as_str)
+        && ["qwen3_5", "qwen3_6", "qwen3_8", "qwen3_next"]
+            .iter()
+            .any(|unsupported| model_type.eq_ignore_ascii_case(unsupported))
+    {
+        anyhow::bail!(
+            "model_type {model_type} is a Gated DeltaNet hybrid architecture and is not supported; \
+             use dense Qwen3-0.6B or Qwen2.5-0.5B-Instruct"
+        );
+    }
+    if let Some(architectures) = raw
+        .get("architectures")
+        .and_then(serde_json::Value::as_array)
+        && architectures
+            .iter()
+            .filter_map(|value| value.as_str())
+            .any(|name| {
+                ["Qwen3Next", "Qwen3_5", "Qwen3_6", "Qwen3_8"]
+                    .iter()
+                    .any(|unsupported| name.contains(unsupported))
+            })
+    {
+        anyhow::bail!(
+            "Gated DeltaNet hybrid architecture detected in config.json; only dense Qwen3/Qwen2 \
+             checkpoints are supported"
+        );
+    }
     let value = if raw.get("hidden_size").is_some() {
         raw
     } else if let Some(text_config) = raw.get("text_config") {
@@ -178,6 +206,10 @@ struct Qwen2Layer {
     o_proj: Linear,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    /// Qwen3 applies per-head RMSNorm to q and k before RoPE. Qwen2 checkpoints
+    /// do not ship these tensors, so the loader keeps them optional.
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
@@ -190,6 +222,24 @@ impl Qwen2Layer {
         let attention_width = config.attention_width();
         let kv_width = config.num_kv_heads * config.head_dim;
         let mlp = vb.pp("mlp");
+        let q_norm = if attention.contains_tensor("q_norm.weight") {
+            Some(RmsNorm::load(
+                attention.pp("q_norm"),
+                config.head_dim,
+                config.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
+        let k_norm = if attention.contains_tensor("k_norm.weight") {
+            Some(RmsNorm::load(
+                attention.pp("k_norm"),
+                config.head_dim,
+                config.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             q_proj: load_linear(attention.pp("q_proj"), hidden, attention_width)?,
             k_proj: load_linear(attention.pp("k_proj"), hidden, kv_width)?,
@@ -201,6 +251,8 @@ impl Qwen2Layer {
                 hidden,
                 config.rms_norm_eps,
             )?,
+            q_norm,
+            k_norm,
             gate_proj: load_linear(mlp.pp("gate_proj"), hidden, config.intermediate_size)?,
             up_proj: load_linear(mlp.pp("up_proj"), hidden, config.intermediate_size)?,
             down_proj: load_linear(mlp.pp("down_proj"), config.intermediate_size, hidden)?,
@@ -302,6 +354,12 @@ fn write_kv_block(
     Ok(())
 }
 
+/// Per-layer paged K/V pools shared with the tier bridge.
+struct QwenKvPools {
+    k: Vec<Tensor>,
+    v: Vec<Tensor>,
+}
+
 pub struct Qwen2Model {
     config: Qwen2Config,
     device: Device,
@@ -312,8 +370,7 @@ pub struct Qwen2Model {
     tied_weight: Tensor,
     cos: Tensor,
     sin: Tensor,
-    k_pools: Vec<Tensor>,
-    v_pools: Vec<Tensor>,
+    pools: Arc<Mutex<QwenKvPools>>,
     block_size: usize,
 }
 
@@ -329,17 +386,21 @@ impl Qwen2Model {
         let vocab = config.vocab_size;
         let hidden = config.hidden_size;
 
-        // HF checkpoints usually prefix everything with `model.`. Fall back to
-        // a root layout if the prefixed embedding tensor cannot be loaded.
-        let prefixed = vb.clone().pp("model");
-        let (model_vb, embed_tokens) =
-            match embedding(vocab, hidden, prefixed.clone().pp("embed_tokens")) {
-                Ok(embedding) => (prefixed, embedding),
-                Err(_) => (
-                    vb.clone(),
-                    embedding(vocab, hidden, vb.clone().pp("embed_tokens"))?,
-                ),
-            };
+        // HF checkpoints usually prefix everything with `model.`. Check for the
+        // tensor explicitly: a VarMap-backed builder would otherwise silently
+        // create a zero embedding on a miss.
+        let (model_vb, embed_tokens) = if vb.contains_tensor("model.embed_tokens.weight") {
+            let prefixed = vb.clone().pp("model");
+            (
+                prefixed.clone(),
+                embedding(vocab, hidden, prefixed.pp("embed_tokens"))?,
+            )
+        } else {
+            (
+                vb.clone(),
+                embedding(vocab, hidden, vb.clone().pp("embed_tokens"))?,
+            )
+        };
 
         let mut layers = Vec::with_capacity(config.num_layers);
         let layer_vb = model_vb.pp("layers");
@@ -349,16 +410,16 @@ impl Qwen2Model {
         let norm = RmsNorm::load(model_vb.pp("norm"), hidden, config.rms_norm_eps)?;
 
         let tied_weight = embed_tokens.embeddings().clone();
-        let lm_head = if config.tie_word_embeddings {
+        let lm_head = if config.tie_word_embeddings || !vb.contains_tensor("lm_head.weight") {
+            if !config.tie_word_embeddings {
+                tracing::warn!("lm_head.weight missing; using tied embeddings");
+            }
             None
         } else {
-            match vb.get((vocab, hidden), "lm_head.weight") {
-                Ok(weight) => Some(Linear::new(weight, None)),
-                Err(_) => {
-                    tracing::warn!("lm_head.weight missing; using tied embeddings");
-                    None
-                }
-            }
+            Some(Linear::new(
+                vb.get((vocab, hidden), "lm_head.weight")?,
+                None,
+            ))
         };
 
         let (cos, sin) = rope_tables(
@@ -386,8 +447,10 @@ impl Qwen2Model {
             tied_weight,
             cos,
             sin,
-            k_pools,
-            v_pools,
+            pools: Arc::new(Mutex::new(QwenKvPools {
+                k: k_pools,
+                v: v_pools,
+            })),
             block_size,
         })
     }
@@ -434,18 +497,13 @@ impl Qwen2Model {
         let slot_tensor =
             Tensor::from_vec(slot_indices, (total_len,), device).map_err(candle_error)?;
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
+        let pools = Arc::clone(&self.pools);
+        let pools = pools
+            .lock()
+            .map_err(|_| ModelError::Backend("paged KV pool lock poisoned".to_string()))?;
 
         {
-            let Qwen2Model {
-                layers,
-                k_pools,
-                v_pools,
-                cos,
-                sin,
-                config,
-                ..
-            } = self;
-            for (layer_index, layer) in layers.iter().enumerate() {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
                 let residual = &hidden;
                 let normalized = layer
                     .input_layernorm
@@ -456,28 +514,39 @@ impl Qwen2Model {
                 let v = layer.v_proj.forward(&normalized).map_err(candle_error)?;
 
                 let q = q
-                    .reshape((1, seq_len, config.num_heads, config.head_dim))
+                    .reshape((1, seq_len, self.config.num_heads, self.config.head_dim))
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
                 let k = k
-                    .reshape((1, seq_len, config.num_kv_heads, config.head_dim))
+                    .reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
                 let v = v
-                    .reshape((1, seq_len, config.num_kv_heads, config.head_dim))
+                    .reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
 
-                let q = apply_rope(&q, cos, sin, start, seq_len).map_err(candle_error)?;
-                let k = apply_rope(&k, cos, sin, start, seq_len).map_err(candle_error)?;
+                let q = match &layer.q_norm {
+                    Some(norm) => norm.forward(&q).map_err(candle_error)?,
+                    None => q,
+                };
+                let k = match &layer.k_norm {
+                    Some(norm) => norm.forward(&k).map_err(candle_error)?,
+                    None => k,
+                };
 
-                write_kv_block(&k_pools[layer_index], &v_pools[layer_index], &k, &v, &slots)
+                let q =
+                    apply_rope(&q, &self.cos, &self.sin, start, seq_len).map_err(candle_error)?;
+                let k =
+                    apply_rope(&k, &self.cos, &self.sin, start, seq_len).map_err(candle_error)?;
+
+                write_kv_block(&pools.k[layer_index], &pools.v[layer_index], &k, &v, &slots)
                     .map_err(candle_error)?;
 
                 let attention = gather_attention(
                     &q,
-                    &k_pools[layer_index],
-                    &v_pools[layer_index],
+                    &pools.k[layer_index],
+                    &pools.v[layer_index],
                     &slot_tensor,
                     &mask,
                     n_rep,
@@ -485,7 +554,7 @@ impl Qwen2Model {
                 .map_err(candle_error)?;
                 let attention = attention
                     .transpose(1, 2)
-                    .and_then(|tensor| tensor.reshape((1, seq_len, config.attention_width())))
+                    .and_then(|tensor| tensor.reshape((1, seq_len, self.config.attention_width())))
                     .map_err(candle_error)?;
                 let attention = layer.o_proj.forward(&attention).map_err(candle_error)?;
                 hidden = residual.add(&attention).map_err(candle_error)?;
@@ -550,8 +619,12 @@ impl Qwen2Model {
         let block_size = self.block_size;
         let start = src * block_size;
         let destination = dst * block_size;
-        let total_slots = self
-            .k_pools
+        let pools = self
+            .pools
+            .lock()
+            .map_err(|_| ModelError::Backend("paged KV pool lock poisoned".to_string()))?;
+        let total_slots = pools
+            .k
             .first()
             .map(|pool| pool.dim(0))
             .transpose()
@@ -562,7 +635,7 @@ impl Qwen2Model {
                 "block copy out of range: src={src} dst={dst} slots={total_slots}"
             )));
         }
-        for (k_pool, v_pool) in self.k_pools.iter().zip(self.v_pools.iter()) {
+        for (k_pool, v_pool) in pools.k.iter().zip(pools.v.iter()) {
             let k = k_pool
                 .narrow(0, start, block_size)
                 .and_then(|tensor| tensor.contiguous())
@@ -573,6 +646,107 @@ impl Qwen2Model {
                 .map_err(candle_error)?;
             k_pool.slice_set(&k, 0, destination).map_err(candle_error)?;
             v_pool.slice_set(&v, 0, destination).map_err(candle_error)?;
+        }
+        Ok(())
+    }
+
+    fn gpu_bridge(&self) -> QwenGpuBridge {
+        QwenGpuBridge {
+            pools: Arc::clone(&self.pools),
+            device: self.device.clone(),
+            block_size: self.block_size,
+            kv_heads: self.config.num_kv_heads,
+            head_dim: self.config.head_dim,
+            num_layers: self.config.num_layers,
+        }
+    }
+}
+
+/// Byte-level bridge from the candle paged KV pools to the tier store.
+///
+/// v1 serializes each layer's K and V block as f32 bytes. A future optimization
+/// can copy device-to-host asynchronously and respect the pool dtype (f16/bf16)
+/// without changing the `GpuBridge` contract.
+#[derive(Clone)]
+pub struct QwenGpuBridge {
+    pools: Arc<Mutex<QwenKvPools>>,
+    device: Device,
+    block_size: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+}
+
+impl QwenGpuBridge {
+    fn expected_bytes(&self) -> usize {
+        self.num_layers * 2 * self.block_size * self.kv_heads * self.head_dim * 4
+    }
+}
+
+impl GpuBridge for QwenGpuBridge {
+    fn block_bytes(&self) -> usize {
+        self.expected_bytes()
+    }
+
+    fn read_block(&mut self, block: BlockId) -> Result<Vec<u8>, String> {
+        let start = block
+            .checked_mul(self.block_size)
+            .ok_or_else(|| format!("block {block} offset overflow"))?;
+        let pools = self
+            .pools
+            .lock()
+            .map_err(|_| "paged KV pool lock poisoned".to_string())?;
+        let mut bytes = Vec::with_capacity(self.expected_bytes());
+        for pool in pools.k.iter().chain(pools.v.iter()) {
+            let values = pool
+                .narrow(0, start, self.block_size)
+                .and_then(|tensor| tensor.flatten_all())
+                .and_then(|tensor| tensor.to_vec1::<f32>())
+                .map_err(|error| format!("cannot read KV block {block}: {error}"))?;
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn write_block(&mut self, block: BlockId, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() != self.expected_bytes() {
+            return Err(format!(
+                "KV block {block} byte length {} does not match expected {}",
+                bytes.len(),
+                self.expected_bytes()
+            ));
+        }
+        let start = block
+            .checked_mul(self.block_size)
+            .ok_or_else(|| format!("block {block} offset overflow"))?;
+        let values_per_pool = self.block_size * self.kv_heads * self.head_dim;
+        let bytes_per_pool = values_per_pool * 4;
+        let pools = self
+            .pools
+            .lock()
+            .map_err(|_| "paged KV pool lock poisoned".to_string())?;
+        for (pool, chunk) in pools
+            .k
+            .iter()
+            .chain(pools.v.iter())
+            .zip(bytes.chunks_exact(bytes_per_pool))
+        {
+            let values: Vec<f32> = chunk
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect();
+            let tensor = Tensor::from_vec(
+                values,
+                (self.block_size, self.kv_heads, self.head_dim),
+                &self.device,
+            )
+            .map_err(|error| format!("cannot rebuild KV block {block}: {error}"))?;
+            pool.slice_set(&tensor, 0, start)
+                .map_err(|error| format!("cannot write KV block {block}: {error}"))?;
         }
         Ok(())
     }
@@ -666,6 +840,14 @@ pub struct Qwen2Executor {
     model: Qwen2Model,
 }
 
+impl Qwen2Executor {
+    /// Share the paged KV pools with the tier store. The bridge holds an Arc to
+    /// the same tensors the executor writes.
+    pub fn gpu_bridge(&self) -> QwenGpuBridge {
+        self.model.gpu_bridge()
+    }
+}
+
 impl Executor for Qwen2Executor {
     fn forward(
         &mut self,
@@ -692,8 +874,41 @@ impl Executor for Qwen2Executor {
     }
 
     fn name(&self) -> &'static str {
-        "qwen2"
+        "qwen"
     }
+}
+
+fn load_shards_into_varmap(
+    shards: &[PathBuf],
+    device: &Device,
+) -> anyhow::Result<candle_nn::VarMap> {
+    let mut var_map = candle_nn::VarMap::new();
+    // First pass: create every variable with its shape. Each shard is mmapped
+    // alone and dropped before the next one is touched.
+    for shard in shards {
+        // SAFETY: read-only mmap of an operator-supplied checkpoint shard; the
+        // mapping is dropped at the end of this loop iteration.
+        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(shard)? };
+        for (name, view) in tensors.tensors() {
+            let _ = var_map.get(
+                view.shape().to_vec(),
+                &name,
+                candle_nn::Init::Const(0.0),
+                DType::F32,
+                device,
+            )?;
+        }
+    }
+    // Second pass: copy one tensor at a time into the preallocated variables.
+    for shard in shards {
+        // SAFETY: same contract as the first pass.
+        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(shard)? };
+        for (name, _) in tensors.tensors() {
+            let tensor = tensors.load(&name, device)?.to_dtype(DType::F32)?;
+            var_map.set_one(&name, tensor)?;
+        }
+    }
+    Ok(var_map)
 }
 
 /// Load a HuggingFace Qwen2 directory (`config.json`, `tokenizer.json`, and at
@@ -721,9 +936,27 @@ pub fn load_model_and_tokenizer(
         anyhow::bail!("no *.safetensors shards found in {}", directory.display());
     }
 
-    // SAFETY: the model directory is supplied by the operator and is expected to
-    // contain immutable checkpoint files for the lifetime of the process.
-    let vb = unsafe { NnVarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)? };
+    // Never mmap more than one safetensors shard at a time. A single-shard
+    // checkpoint (Qwen3-0.6B) uses the low-overhead mmap path; split
+    // checkpoints are copied shard-by-shard into a VarMap so only one mapping
+    // is live at any moment.
+    let var_map = if shards.len() > 1 {
+        tracing::info!(
+            "Loading {} safetensors shards sequentially (one mmap at a time)",
+            shards.len()
+        );
+        Some(load_shards_into_varmap(&shards, &device)?)
+    } else {
+        None
+    };
+    let vb = match &var_map {
+        Some(var_map) => NnVarBuilder::from_varmap(var_map, DType::F32, &device),
+        None => {
+            // SAFETY: exactly one checkpoint shard is mmapped for the lifetime
+            // of the builder; the operator supplies an immutable checkpoint.
+            unsafe { NnVarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)? }
+        }
+    };
 
     let total_slots = engine_config.total_physical_blocks * engine_config.block_size;
     if total_slots == 0 || engine_config.block_size == 0 {
@@ -998,6 +1231,72 @@ mod tests {
         );
         assert_eq!(tokenizer.eos_token_ids(), &[6, 7]);
 
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn qwen3_qk_norm_tensors_are_detected_and_optional() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F32, &device);
+        for name in [
+            "layers.0.self_attn.q_norm.weight",
+            "layers.0.self_attn.k_norm.weight",
+        ] {
+            let _ = var_map
+                .get(
+                    config.head_dim,
+                    name,
+                    candle_nn::Init::Const(1.0),
+                    DType::F32,
+                    &device,
+                )
+                .unwrap();
+        }
+        let model = Qwen2Model::load(&config, &vb, device, 64, 4, 64).unwrap();
+        assert!(model.layers[0].q_norm.is_some());
+        assert!(model.layers[0].k_norm.is_some());
+        assert!(
+            model.layers[1].q_norm.is_none(),
+            "Qwen2-style layers must not invent zero QK-norm weights"
+        );
+    }
+
+    #[test]
+    fn gpu_bridge_roundtrips_f32_kv_bytes() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F32, &device);
+        let model = Qwen2Model::load(&config, &vb, device, 64, 4, 64).unwrap();
+        let mut bridge = model.gpu_bridge();
+        let bytes: Vec<u8> = (0..bridge.block_bytes())
+            .map(|index| (index * 37 % 251) as u8)
+            .collect();
+        bridge.write_block(3, &bytes).unwrap();
+        assert_eq!(bridge.read_block(3).unwrap(), bytes);
+
+        bridge.write_block(5, &bytes).unwrap();
+        assert_eq!(bridge.read_block(5).unwrap(), bytes);
+        assert_ne!(bridge.read_block(4).unwrap(), bytes);
+    }
+
+    #[test]
+    fn hybrid_qwen_architectures_are_rejected_loudly() {
+        let directory =
+            std::env::temp_dir().join(format!("nexuskv-hybrid-guard-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("config.json"),
+            serde_json::json!({"model_type": "qwen3_next"}).to_string(),
+        )
+        .unwrap();
+        let error = read_hf_config(&directory).unwrap_err().to_string();
+        assert!(
+            error.contains("Gated DeltaNet"),
+            "unexpected error: {error}"
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 }
