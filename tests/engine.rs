@@ -51,7 +51,7 @@ async fn submit_stream_and_finish() {
             .expect("timed out waiting for token")
             .expect("channel closed");
         match message {
-            TokenMsg::Token { id, step, text } => {
+            TokenMsg::Token { id, step, text, .. } => {
                 assert_eq!(step, tokens.len() + 1);
                 assert!(!text.is_empty());
                 tokens.push(id);

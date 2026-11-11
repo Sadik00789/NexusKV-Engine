@@ -398,6 +398,7 @@ fn telemetry_payload(
     last_token_at: Option<Instant>,
     is_finished: bool,
     finish_reason: Option<String>,
+    active_block_ids: Vec<usize>,
 ) -> TelemetryPayload {
     let snapshot = state.snapshot();
     let now = Instant::now();
@@ -412,12 +413,6 @@ fn telemetry_payload(
     } else {
         step as f64 / started.elapsed().as_secs_f64().max(1e-6)
     };
-    let active_block_ids = snapshot
-        .seq_blocks
-        .get(&seq_id)
-        .cloned()
-        .unwrap_or_default();
-
     TelemetryPayload {
         sequence_id: seq_id,
         token,
@@ -497,7 +492,7 @@ fn sse_generation_response(
 
         while let Some(message) = rx.recv().await {
             match message {
-                TokenMsg::Token { text, step: message_step, .. } => {
+                TokenMsg::Token { text, step: message_step, block_ids, .. } => {
                     let now = Instant::now();
                     if first_token_at.is_none() {
                         first_token_at = Some(now);
@@ -515,6 +510,7 @@ fn sse_generation_response(
                         previous,
                         false,
                         None,
+                        block_ids,
                     );
                     yield Ok::<Event, Infallible>(
                         Event::default().data(serde_json::to_string(&payload).unwrap_or_default()),
@@ -532,6 +528,7 @@ fn sse_generation_response(
                         last_token_at,
                         true,
                         Some(reason.as_str().to_string()),
+                        Vec::new(),
                     );
                     yield Ok::<Event, Infallible>(
                         Event::default().data(serde_json::to_string(&payload).unwrap_or_default()),

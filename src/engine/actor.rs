@@ -18,9 +18,18 @@ use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub enum TokenMsg {
-    Token { text: String, id: u32, step: usize },
-    Done { reason: FinishReason },
-    Error { message: String },
+    Token {
+        text: String,
+        id: u32,
+        step: usize,
+        block_ids: Vec<BlockId>,
+    },
+    Done {
+        reason: FinishReason,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -784,6 +793,10 @@ impl EngineActor {
     /// the caller's responsibility because speculative steps batch it.
     fn emit_token(&mut self, seq_id: SeqId, token: u32) -> bool {
         let now = Instant::now();
+        // Capture the real page-table blocks at emission time. The HTTP relay
+        // may drain this message after the sequence finishes and its snapshot
+        // entry disappears, so block ids must travel with the token.
+        let block_ids = self.block_manager.blocks_of(seq_id);
         let Some(seq) = self.scheduler.seq_mut(seq_id) else {
             return false;
         };
@@ -801,6 +814,7 @@ impl EngineActor {
             text,
             id: token,
             step,
+            block_ids,
         });
         is_eos
     }
