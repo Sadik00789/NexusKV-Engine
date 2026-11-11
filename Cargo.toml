@@ -3,7 +3,28 @@ name = "nexuskv"
 version = "0.1.0"
 edition = "2024"
 authors = ["NexusKV Engine Contributors"]
-description = "High-Throughput Paged KV-Cache & Speculative Inference Engine"
+description = "Paged KV-Cache & Speculative Inference Engine"
+
+[lib]
+name = "nexuskv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexuskv"
+path = "src/main.rs"
+
+[features]
+default = []
+candle-model = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:tokenizers",
+]
+cuda = [
+    "candle-model",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+]
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
@@ -17,7 +38,15 @@ thiserror = "1.0"
 anyhow = "1.0"
 futures-util = "0.3"
 async-stream = "0.3"
-parking_lot = { version = "0.12", features = ["serde"] }
+
+# Real-model stack. Optional: the default build has no GPU, CUDA, or weights.
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true }
+
+[dev-dependencies]
+proptest = "1.5"
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [build-dependencies]
 cc = { version = "1.2", features = ["parallel"] }

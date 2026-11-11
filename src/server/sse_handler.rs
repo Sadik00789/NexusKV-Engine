@@ -1,68 +1,124 @@
+// src/server/sse_handler.rs
 use crate::config::EngineConfig;
-use crate::engine::{ContinuousScheduler, Sequence, SpeculativeVerifier};
-use crate::memory::{BlockInspectInfo, BlockSpaceManager};
+use crate::engine::{EngineActor, GenerateJob, Request, Scheduler, Snapshot, TokenMsg};
+use crate::memory::BlockSpaceManager;
+use crate::model::{Executor, MockExecutor, MockTokenizer, Tokenizer};
 use axum::{
-    extract::{Json, State},
+    extract::State,
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
 };
-use futures_util::stream::Stream;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-/// Shared thread-safe application state utilizing parking_lot::RwLock
+/// Shared application state. There are no scheduler or allocator locks: the
+/// actor thread is the only writer, and telemetry is published as a snapshot.
 #[derive(Clone)]
 pub struct AppState {
     pub config: EngineConfig,
-    pub block_manager: Arc<RwLock<BlockSpaceManager>>,
-    pub scheduler: Arc<RwLock<ContinuousScheduler>>,
-    pub verifier: Arc<RwLock<SpeculativeVerifier>>,
-    pub sequence_counter: Arc<AtomicUsize>,
+    pub request_tx: UnboundedSender<Request>,
+    pub snapshot: Arc<Mutex<Snapshot>>,
+    pub tokenizer: Arc<dyn Tokenizer>,
+    pub next_seq: Arc<AtomicUsize>,
+    pub model_id: String,
+    pub executor_name: String,
 }
 
 impl AppState {
     pub fn new(config: EngineConfig) -> Self {
-        let block_manager = Arc::new(RwLock::new(BlockSpaceManager::new(
+        Self::mock(config)
+    }
+
+    pub fn mock(config: EngineConfig) -> Self {
+        Self::with_executor(
+            config,
+            Box::new(MockExecutor::new()),
+            Arc::new(MockTokenizer),
+            "nexuskv-mock-v1",
+        )
+    }
+
+    pub fn with_executor(
+        config: EngineConfig,
+        executor: Box<dyn Executor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        let model_id = model_id.into();
+        let executor_name = executor.name().to_string();
+        if executor.is_mock() {
+            tracing::warn!(
+                "MOCK EXECUTOR ACTIVE — token streams are synthetic; no model weights are loaded. \
+                 This mode is labeled \"executor\": \"mock\" in /v1/models and /v1/metrics."
+            );
+        }
+
+        let snapshot = Arc::new(Mutex::new(Snapshot::initial(
+            &model_id,
+            &executor_name,
+            config.total_physical_blocks,
+            config.block_size,
+        )));
+        let (request_tx, request_rx) = unbounded_channel();
+        let scheduler = Scheduler::new(config.max_num_seqs, config.max_num_batched_tokens);
+        let block_manager = BlockSpaceManager::new(
             config.total_physical_blocks,
             config.block_size,
             config.max_blocks_per_seq,
-        )));
-
-        let scheduler = Arc::new(RwLock::new(ContinuousScheduler::new(
-            config.max_num_seqs,
-            Arc::clone(&block_manager),
-        )));
-
-        let verifier = Arc::new(RwLock::new(SpeculativeVerifier::new(Arc::clone(
-            &block_manager,
-        ))));
+        );
+        let actor = EngineActor::new(
+            request_rx,
+            scheduler,
+            block_manager,
+            executor,
+            Arc::clone(&tokenizer),
+            Arc::clone(&snapshot),
+            model_id.clone(),
+        );
+        std::thread::Builder::new()
+            .name("nexuskv-engine".to_string())
+            .spawn(move || actor.run())
+            .expect("failed to start the NexusKV engine thread");
 
         Self {
             config,
-            block_manager,
-            scheduler,
-            verifier,
-            sequence_counter: Arc::new(AtomicUsize::new(1)),
+            request_tx,
+            snapshot,
+            tokenizer,
+            next_seq: Arc::new(AtomicUsize::new(1)),
+            model_id,
+            executor_name,
         }
+    }
+
+    pub fn next_sequence_id(&self) -> usize {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
-/// RAII Drop Guard that triggers sequence cancellation and block deallocation
-/// if the client disconnects or the SSE stream future drops mid-flight.
+/// RAII guard: if the client disconnects before a sequence finishes, tell the
+/// actor to abort it. No locks, no scheduler access from the HTTP task.
 pub struct AbortDropGuard {
     pub seq_id: usize,
-    pub scheduler: Arc<RwLock<ContinuousScheduler>>,
+    pub request_tx: UnboundedSender<Request>,
     pub completed: Arc<AtomicBool>,
 }
 
@@ -70,26 +126,25 @@ impl Drop for AbortDropGuard {
     fn drop(&mut self) {
         if !self.completed.load(Ordering::SeqCst) {
             tracing::warn!(
-                "Client connection dropped/aborted for sequence #{}. Immediate VRAM page reclamation triggered.",
+                "Client disconnected for sequence #{}. Sending abort to the engine actor.",
                 self.seq_id
             );
-            let mut sched = self.scheduler.write();
-            let _ = sched.abort_sequence(self.seq_id);
+            let _ = self.request_tx.send(Request::Abort { seq: self.seq_id });
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct GenerateRequest {
     pub prompt: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    #[serde(default)]
+    pub spec: bool,
 }
 
-#[allow(dead_code)]
 fn default_max_tokens() -> usize {
     64
 }
@@ -107,29 +162,15 @@ pub struct TelemetryPayload {
     pub memory_usage_ratio: f64,
     pub prefix_cache_hit_ratio: f64,
     pub speculative_acceptance_rate: f64,
+    pub adaptive_k: usize,
+    pub executor: String,
     pub active_block_ids: Vec<usize>,
     pub is_finished: bool,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SystemMetricsResponse {
-    pub total_blocks: usize,
-    pub allocated_blocks: usize,
-    pub free_blocks: usize,
-    pub memory_usage_percent: f64,
-    pub running_sequences: usize,
-    pub waiting_sequences: usize,
-    pub prefix_cache_hit_ratio: f64,
-    pub prefix_cache_lookups: usize,
-    pub prefix_cache_hits: usize,
-    pub speculative_acceptance_rate: f64,
-    pub active_sequence_ids: Vec<usize>,
-    pub block_inspect_info: Vec<BlockInspectInfo>,
-}
-
 // ---------------------------------------------------------------------------
-// OpenAI API Compatibility Structs
+// OpenAI API compatibility structs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -139,7 +180,6 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct ChatCompletionRequest {
     #[serde(default = "default_model_name")]
     pub model: String,
@@ -151,7 +191,6 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
 }
 
-#[allow(dead_code)]
 fn default_model_name() -> String {
     "nexuskv-engine-v1".to_string()
 }
@@ -214,260 +253,282 @@ pub struct ModelCard {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    pub executor: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ModelListResponse {
     pub object: String,
+    pub executor: String,
     pub data: Vec<ModelCard>,
 }
 
 // ---------------------------------------------------------------------------
-// Route Handlers
+// Route handlers
 // ---------------------------------------------------------------------------
 
 pub async fn health_check() -> &'static str {
     "OK"
 }
 
-pub async fn list_models() -> Json<ModelListResponse> {
-    Json(ModelListResponse {
-        object: "list".to_string(),
-        data: vec![
-            ModelCard {
-                id: "nexuskv-engine-v1".to_string(),
-                object: "model".to_string(),
-                created: 1700000000,
-                owned_by: "nexuskv".to_string(),
-            },
-            ModelCard {
-                id: "nexuskv-speculative-v1".to_string(),
-                object: "model".to_string(),
-                created: 1700000000,
-                owned_by: "nexuskv".to_string(),
-            },
-        ],
-    })
-}
-
-pub async fn get_metrics(State(state): State<AppState>) -> Json<SystemMetricsResponse> {
-    let block_mgr = state.block_manager.read();
-    let scheduler = state.scheduler.read();
-    let verifier = state.verifier.read();
-
-    let total = state.config.total_physical_blocks;
-    let allocated = block_mgr.allocated_blocks_count();
-    let free = block_mgr.free_blocks_count();
-    let prefix_ratio = block_mgr.prefix_cache_hit_ratio();
-    let inspect_info = block_mgr.get_block_inspect_info();
-
-    Json(SystemMetricsResponse {
-        total_blocks: total,
-        allocated_blocks: allocated,
-        free_blocks: free,
-        memory_usage_percent: (allocated as f64 / total.max(1) as f64) * 100.0,
-        running_sequences: scheduler.running_count(),
-        waiting_sequences: scheduler.waiting_count(),
-        prefix_cache_hit_ratio: prefix_ratio,
-        prefix_cache_lookups: block_mgr.prefix_cache_lookups,
-        prefix_cache_hits: block_mgr.prefix_cache_hits,
-        speculative_acceptance_rate: verifier.overall_acceptance_rate().clamp(0.0, 1.0),
-        active_sequence_ids: scheduler.active_sequence_ids(),
-        block_inspect_info: inspect_info,
-    })
-}
-
-/// Server-Sent Events (SSE) streaming token generation & VRAM telemetry with AbortDropGuard
-pub async fn stream_generation(
-    State(state): State<AppState>,
-    Json(payload): Json<GenerateRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let seq_id = state.sequence_counter.fetch_add(1, Ordering::SeqCst);
-    let max_tokens = payload.max_tokens;
-
-    let prompt_tokens: Vec<u32> = if payload.prompt.is_empty() {
-        vec![1, 2, 3]
-    } else {
-        payload.prompt.bytes().map(|b| b as u32).collect()
-    };
-
-    let sequence = Sequence::new(seq_id, prompt_tokens, max_tokens);
-
-    {
-        let mut scheduler = state.scheduler.write();
-        scheduler.submit_sequence(sequence);
-        let _ = scheduler.schedule_iteration();
+pub async fn list_models(State(state): State<AppState>) -> axum::Json<ModelListResponse> {
+    let snapshot = state.snapshot();
+    let executor = snapshot.executor.clone();
+    let mut data = vec![ModelCard {
+        id: state.model_id.clone(),
+        object: "model".to_string(),
+        created: 1700000000,
+        owned_by: "nexuskv".to_string(),
+        executor: executor.clone(),
+    }];
+    if state.model_id != "nexuskv-engine-v1" {
+        data.push(ModelCard {
+            id: "nexuskv-engine-v1".to_string(),
+            object: "model".to_string(),
+            created: 1700000000,
+            owned_by: "nexuskv".to_string(),
+            executor: executor.clone(),
+        });
     }
 
-    let completed_flag = Arc::new(AtomicBool::new(false));
-    let drop_guard = AbortDropGuard {
-        seq_id,
-        scheduler: Arc::clone(&state.scheduler),
-        completed: Arc::clone(&completed_flag),
-    };
+    axum::Json(ModelListResponse {
+        object: "list".to_string(),
+        executor,
+        data,
+    })
+}
 
-    let scheduler_clone = Arc::clone(&state.scheduler);
-    let block_mgr_clone = Arc::clone(&state.block_manager);
-    let verifier_clone = Arc::clone(&state.verifier);
-    let total_physical_blocks = state.config.total_physical_blocks;
+pub async fn get_metrics(State(state): State<AppState>) -> axum::Json<Snapshot> {
+    axum::Json(state.snapshot())
+}
+
+fn generation_id(seq_id: usize) -> String {
+    format!("chatcmpl-nexus-{seq_id}")
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn make_guard(state: &AppState, seq_id: usize, completed: Arc<AtomicBool>) -> AbortDropGuard {
+    AbortDropGuard {
+        seq_id,
+        request_tx: state.request_tx.clone(),
+        completed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn telemetry_payload(
+    state: &AppState,
+    seq_id: usize,
+    token: String,
+    step: usize,
+    started: Instant,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
+    is_finished: bool,
+    finish_reason: Option<String>,
+) -> TelemetryPayload {
+    let snapshot = state.snapshot();
+    let now = Instant::now();
+    let ttft_ms = first_token_at
+        .map(|first| first.duration_since(started).as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    let itl_ms = last_token_at
+        .map(|last| now.duration_since(last).as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    let tokens_per_sec = if step == 0 {
+        0.0
+    } else {
+        step as f64 / started.elapsed().as_secs_f64().max(1e-6)
+    };
+    let active_block_ids = snapshot
+        .seq_blocks
+        .get(&seq_id)
+        .cloned()
+        .unwrap_or_default();
+
+    TelemetryPayload {
+        sequence_id: seq_id,
+        token,
+        step,
+        tokens_per_sec,
+        ttft_ms,
+        itl_ms,
+        allocated_blocks: snapshot.allocated_blocks,
+        total_blocks: snapshot.total_blocks,
+        memory_usage_ratio: snapshot.memory_usage_ratio,
+        prefix_cache_hit_ratio: snapshot.prefix_cache_hit_ratio,
+        speculative_acceptance_rate: snapshot.speculative_acceptance_rate,
+        adaptive_k: snapshot.adaptive_k,
+        executor: snapshot.executor,
+        active_block_ids,
+        is_finished,
+        finish_reason,
+    }
+}
+
+pub async fn stream_generation(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<GenerateRequest>,
+) -> Response {
+    let prompt_tokens = state.tokenizer.encode(&payload.prompt);
+    if prompt_tokens.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "prompt must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let seq_id = state.next_sequence_id();
+    let (tx, mut rx) = unbounded_channel::<TokenMsg>();
+    let job = GenerateJob {
+        seq: seq_id,
+        prompt: prompt_tokens,
+        max_tokens: payload.max_tokens.max(1),
+        temperature: payload.temperature.unwrap_or(0.7).max(0.0),
+        top_p: payload.top_p.unwrap_or(1.0),
+        spec: payload.spec,
+        tx,
+    };
+    if state.request_tx.send(Request::Generate(job)).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
+    }
+
+    let completed = Arc::new(AtomicBool::new(false));
+    let guard = make_guard(&state, seq_id, Arc::clone(&completed));
+    let stream_state = state.clone();
 
     let stream = async_stream::stream! {
-        let _guard = drop_guard;
-        let start_time = Instant::now();
-        let mut step = 0;
-        let mut first_token_time: Option<Instant> = None;
-        let mut last_token_time: Option<Instant> = None;
+        let _guard = guard;
+        let started = Instant::now();
+        let mut first_token_at: Option<Instant> = None;
+        let mut last_token_at: Option<Instant> = None;
+        let mut step = 0usize;
 
-        // Rich, realistic architectural token vocabulary
-        let dynamic_tokens = [
-            "PagedAttention", "virtualizes", "the", "KV", "cache", "by", "partitioning",
-            "sequence", "keys", "and", "values", "into", "fixed-size", "physical", "pages", "(16 tokens/block).",
-            "This", "eliminates", "external", "memory", "fragmentation", "and", "enables",
-            "zero-copy", "Radix", "Trie", "prefix", "sharing", "across", "multi-tenant", "requests.",
-            "During", "speculative", "tree", "decoding,", "unverified", "candidate", "branches",
-            "are", "reclaimed", "via", "O(1)", "page", "table", "pointer", "rollbacks,",
-            "maintaining", "wire-speed", "throughput", "under", "continuous", "batching."
-        ];
-
-        loop {
-            // Smooth pacing for interactive visual inspection
-            tokio::time::sleep(Duration::from_millis(24)).await;
-            step += 1;
-            let now = Instant::now();
-
-            if first_token_time.is_none() {
-                first_token_time = Some(now);
-            }
-            let itl_ms = if let Some(last) = last_token_time {
-                now.duration_since(last).as_secs_f64() * 1000.0
-            } else {
-                24.0
-            };
-            last_token_time = Some(now);
-
-            let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
-            let token_str = format!("{} ", word);
-            let is_last = step >= max_tokens;
-
-            let (allocated, usage_ratio, acceptance_rate, prefix_hit_ratio, active_blocks) = {
-                let mut sched = scheduler_clone.write();
-                let _ = sched.step_sequence(seq_id, (step + 100) as u32, is_last);
-
-                let block_mgr = block_mgr_clone.read();
-                let verifier = verifier_clone.read();
-
-                let active_b = block_mgr.get_sequence_blocks(seq_id).unwrap_or_default();
-
-                (
-                    block_mgr.allocated_blocks_count(),
-                    block_mgr.memory_usage_ratio(),
-                    verifier.overall_acceptance_rate().clamp(0.0, 1.0),
-                    block_mgr.prefix_cache_hit_ratio().clamp(0.0, 1.0),
-                    active_b,
-                )
-            };
-
-            let elapsed_sec = start_time.elapsed().as_secs_f64();
-            let tokens_per_sec = if elapsed_sec > 0.0 {
-                (step as f64) / elapsed_sec
-            } else {
-                0.0
-            };
-
-            let ttft_ms = first_token_time
-                .map(|t| t.duration_since(start_time).as_secs_f64() * 1000.0)
-                .unwrap_or(24.0);
-
-            let telemetry = TelemetryPayload {
-                sequence_id: seq_id,
-                token: token_str,
-                step,
-                tokens_per_sec: (tokens_per_sec * 10.0).round() / 10.0,
-                ttft_ms: (ttft_ms * 10.0).round() / 10.0,
-                itl_ms: (itl_ms * 10.0).round() / 10.0,
-                allocated_blocks: allocated,
-                total_blocks: total_physical_blocks,
-                memory_usage_ratio: usage_ratio,
-                prefix_cache_hit_ratio: prefix_hit_ratio,
-                speculative_acceptance_rate: acceptance_rate,
-                active_block_ids: active_blocks,
-                is_finished: is_last,
-                finish_reason: if is_last {
-                    Some("MaxTokensReached".into())
-                } else {
-                    None
-                },
-            };
-
-            if let Ok(json_data) = serde_json::to_string(&telemetry) {
-                yield Ok(Event::default().data(json_data));
-            }
-
-            if is_last {
-                completed_flag.store(true, Ordering::SeqCst);
-                break;
+        while let Some(message) = rx.recv().await {
+            match message {
+                TokenMsg::Token { text, step: message_step, .. } => {
+                    let now = Instant::now();
+                    if first_token_at.is_none() {
+                        first_token_at = Some(now);
+                    }
+                    let previous = last_token_at;
+                    last_token_at = Some(now);
+                    step = message_step;
+                    let payload = telemetry_payload(
+                        &stream_state,
+                        seq_id,
+                        text,
+                        step,
+                        started,
+                        first_token_at,
+                        previous,
+                        false,
+                        None,
+                    );
+                    yield Ok::<Event, Infallible>(
+                        Event::default().data(serde_json::to_string(&payload).unwrap_or_default()),
+                    );
+                }
+                TokenMsg::Done { reason } => {
+                    completed.store(true, Ordering::SeqCst);
+                    let payload = telemetry_payload(
+                        &stream_state,
+                        seq_id,
+                        String::new(),
+                        step,
+                        started,
+                        first_token_at,
+                        last_token_at,
+                        true,
+                        Some(reason.as_str().to_string()),
+                    );
+                    yield Ok::<Event, Infallible>(
+                        Event::default().data(serde_json::to_string(&payload).unwrap_or_default()),
+                    );
+                    break;
+                }
+                TokenMsg::Error { message } => {
+                    completed.store(true, Ordering::SeqCst);
+                    let error = serde_json::json!({"error": message});
+                    yield Ok::<Event, Infallible>(
+                        Event::default().event("error").data(error.to_string()),
+                    );
+                    break;
+                }
             }
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Json(payload): Json<ChatCompletionRequest>,
+    axum::Json(payload): axum::Json<ChatCompletionRequest>,
 ) -> Response {
-    let max_tokens = payload.max_tokens.unwrap_or(64);
-    let seq_id = state.sequence_counter.fetch_add(1, Ordering::SeqCst);
+    let messages: Vec<(String, String)> = payload
+        .messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.clone()))
+        .collect();
+    let prompt_tokens = state.tokenizer.encode_chat(&messages);
+    if prompt_tokens.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "messages must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let seq_id = state.next_sequence_id();
+    let max_tokens = payload.max_tokens.unwrap_or(64).max(1);
+    let temperature = payload.temperature.unwrap_or(0.7).max(0.0);
+    let top_p = payload.top_p.unwrap_or(1.0);
     let model = payload.model.clone();
-
-    let mut prompt = String::new();
-    for msg in &payload.messages {
-        prompt.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
+    let completion_id = generation_id(seq_id);
+    let created = unix_timestamp();
+    let (tx, mut rx) = unbounded_channel::<TokenMsg>();
+    let job = GenerateJob {
+        seq: seq_id,
+        prompt: prompt_tokens.clone(),
+        max_tokens,
+        temperature,
+        top_p,
+        spec: false,
+        tx,
+    };
+    if state.request_tx.send(Request::Generate(job)).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
     }
-    prompt.push_str("<|assistant|>\n");
 
-    let prompt_tokens: Vec<u32> = prompt.bytes().map(|b| b as u32).collect();
-    let prompt_token_count = prompt_tokens.len();
-
-    let sequence = Sequence::new(seq_id, prompt_tokens, max_tokens);
-
-    {
-        let mut scheduler = state.scheduler.write();
-        scheduler.submit_sequence(sequence);
-        let _ = scheduler.schedule_iteration();
-    }
-
-    let created_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let completion_id = format!("chatcmpl-nexus-{}", seq_id);
-
-    let dynamic_tokens = [
-        "NexusKV", "allocates", "physical", "KV", "pages", "dynamically", "with",
-        "zero", "memory", "fragmentation,", "supporting", "lock-free", "continuous",
-        "batching", "and", "Radix", "Trie", "prefix", "caching."
-    ];
+    let completed = Arc::new(AtomicBool::new(false));
+    let guard = make_guard(&state, seq_id, Arc::clone(&completed));
 
     if payload.stream {
-        let completed_flag = Arc::new(AtomicBool::new(false));
-        let drop_guard = AbortDropGuard {
-            seq_id,
-            scheduler: Arc::clone(&state.scheduler),
-            completed: Arc::clone(&completed_flag),
-        };
-
-        let scheduler_clone = Arc::clone(&state.scheduler);
         let stream = async_stream::stream! {
-            let _guard = drop_guard;
-            let mut step = 0;
+            let _guard = guard;
 
             let role_chunk = ChatCompletionChunk {
                 id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
-                created: created_timestamp,
+                created,
                 model: model.clone(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -478,88 +539,131 @@ pub async fn chat_completions(
                     finish_reason: None,
                 }],
             };
-            if let Ok(json_str) = serde_json::to_string(&role_chunk) {
-                yield Ok::<Event, Infallible>(Event::default().data(json_str));
-            }
+            yield Ok::<Event, Infallible>(
+                Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default()),
+            );
 
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                step += 1;
-                let is_last = step >= max_tokens;
-
-                let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
-                let token_content = format!("{} ", word);
-
-                {
-                    let mut sched = scheduler_clone.write();
-                    let _ = sched.step_sequence(seq_id, (step + 100) as u32, is_last);
-                }
-
-                let chunk = ChatCompletionChunk {
-                    id: completion_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: created_timestamp,
-                    model: model.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatChoiceDelta {
-                            role: None,
-                            content: Some(token_content),
-                        },
-                        finish_reason: if is_last { Some("stop".to_string()) } else { None },
-                    }],
-                };
-
-                if let Ok(json_str) = serde_json::to_string(&chunk) {
-                    yield Ok::<Event, Infallible>(Event::default().data(json_str));
-                }
-
-                if is_last {
-                    completed_flag.store(true, Ordering::SeqCst);
-                    break;
+            while let Some(message) = rx.recv().await {
+                match message {
+                    TokenMsg::Token { text, .. } => {
+                        let chunk = ChatCompletionChunk {
+                            id: completion_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChatChunkChoice {
+                                index: 0,
+                                delta: ChatChoiceDelta {
+                                    role: None,
+                                    content: Some(text),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        yield Ok::<Event, Infallible>(
+                            Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()),
+                        );
+                    }
+                    TokenMsg::Done { reason } => {
+                        completed.store(true, Ordering::SeqCst);
+                        let chunk = ChatCompletionChunk {
+                            id: completion_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChatChunkChoice {
+                                index: 0,
+                                delta: ChatChoiceDelta {
+                                    role: None,
+                                    content: None,
+                                },
+                                finish_reason: Some(reason.as_str().to_string()),
+                            }],
+                        };
+                        yield Ok::<Event, Infallible>(
+                            Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()),
+                        );
+                        break;
+                    }
+                    TokenMsg::Error { message } => {
+                        completed.store(true, Ordering::SeqCst);
+                        let error = serde_json::json!({"error": message});
+                        yield Ok::<Event, Infallible>(
+                            Event::default().event("error").data(error.to_string()),
+                        );
+                        break;
+                    }
                 }
             }
 
             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
         };
 
-        Sse::new(stream)
+        return Sse::new(stream)
             .keep_alive(KeepAlive::default())
-            .into_response()
-    } else {
-        let mut generated_words = Vec::new();
-
-        for step in 1..=max_tokens {
-            let is_last = step >= max_tokens;
-            let word = dynamic_tokens[(step - 1) % dynamic_tokens.len()];
-            generated_words.push(word);
-
-            let mut sched = state.scheduler.write();
-            let _ = sched.step_sequence(seq_id, (step + 100) as u32, is_last);
-        }
-
-        let full_text = generated_words.join(" ");
-
-        let response = ChatCompletionResponse {
-            id: completion_id,
-            object: "chat.completion".to_string(),
-            created: created_timestamp,
-            model,
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatChoiceMessage {
-                    role: "assistant".to_string(),
-                    content: full_text,
-                },
-                finish_reason: "stop".to_string(),
-            }],
-            usage: UsageInfo {
-                prompt_tokens: prompt_token_count,
-                completion_tokens: max_tokens,
-                total_tokens: prompt_token_count + max_tokens,
-            },
-        };
-
-        (StatusCode::OK, Json(response)).into_response()
+            .into_response();
     }
+
+    let _guard = guard;
+    let mut text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut finish_reason = None;
+    let mut error = None;
+
+    while let Some(message) = rx.recv().await {
+        match message {
+            TokenMsg::Token {
+                text: token_text, ..
+            } => {
+                text.push_str(&token_text);
+                completion_tokens += 1;
+            }
+            TokenMsg::Done { reason } => {
+                completed.store(true, Ordering::SeqCst);
+                finish_reason = Some(reason.as_str().to_string());
+                break;
+            }
+            TokenMsg::Error { message } => {
+                completed.store(true, Ordering::SeqCst);
+                error = Some(message);
+                break;
+            }
+        }
+    }
+
+    if let Some(message) = error {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": message})),
+        )
+            .into_response();
+    }
+    let Some(finish_reason) = finish_reason else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": "engine closed the stream unexpectedly"})),
+        )
+            .into_response();
+    };
+
+    let response = ChatCompletionResponse {
+        id: completion_id,
+        object: "chat.completion".to_string(),
+        created,
+        model,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatChoiceMessage {
+                role: "assistant".to_string(),
+                content: text,
+            },
+            finish_reason,
+        }],
+        usage: UsageInfo {
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens,
+            total_tokens: prompt_tokens.len() + completion_tokens,
+        },
+    };
+    (StatusCode::OK, axum::Json(response)).into_response()
 }
