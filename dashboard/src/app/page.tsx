@@ -5,12 +5,39 @@ import React, { useState, useEffect } from "react";
 import { VramBlockCanvas, BlockInspectData } from "@/components/VramBlockCanvas";
 import { MetricsPanel } from "@/components/MetricsPanel";
 import {
+    applyReplay,
+    countAllocated,
+    type ReplayPayload,
+} from "@/lib/replay";
+import {
     Play,
     Loader2,
     RefreshCw,
     Terminal,
     MessageSquare,
+    GitBranch,
+    History,
 } from "lucide-react";
+
+const ENGINE_URL = "http://127.0.0.1:8080";
+
+interface SessionTreeNode {
+    id: number;
+    parent: number | null;
+    label: string;
+    tokens: number;
+    pinned_blocks: number;
+}
+
+function nodeDepth(node: SessionTreeNode, nodes: SessionTreeNode[]): number {
+    let depth = 0;
+    let parent = node.parent;
+    while (parent !== null && depth < 32) {
+        depth += 1;
+        parent = nodes.find((candidate) => candidate.id === parent)?.parent ?? null;
+    }
+    return depth;
+}
 
 export default function Home() {
     const [prompt, setPrompt] = useState(
@@ -35,6 +62,16 @@ export default function Home() {
     const [blocksMetadata, setBlocksMetadata] = useState<BlockInspectData[] | undefined>(undefined);
     const [executor, setExecutor] = useState<string>("unknown");
 
+    // Time-travel + sessions
+    const [latestTick, setLatestTick] = useState(0);
+    const [scrubTick, setScrubTick] = useState<number | null>(null);
+    const [replayBlocks, setReplayBlocks] = useState<BlockInspectData[] | undefined>(undefined);
+    const [sessionName, setSessionName] = useState("main");
+    const [nodeId, setNodeId] = useState<number | null>(null);
+    const [treeNodes, setTreeNodes] = useState<SessionTreeNode[]>([]);
+    const [sessionBusy, setSessionBusy] = useState(false);
+    const [sessionError, setSessionError] = useState("");
+
     // Engine connection status
     const [engineOnline, setEngineOnline] = useState(false);
 
@@ -42,7 +79,7 @@ export default function Home() {
     useEffect(() => {
         const fetchMetrics = async () => {
             try {
-                const res = await fetch("http://127.0.0.1:8080/v1/metrics");
+                const res = await fetch(`${ENGINE_URL}/v1/metrics`);
                 if (res.ok) {
                     const data = await res.json();
                     setEngineOnline(true);
@@ -55,6 +92,7 @@ export default function Home() {
                     setMemoryRatio(data.memory_usage_percent / 100.0);
                     setPrefixCacheHitRatio(Number(data.prefix_cache_hit_ratio ?? 0));
                     setAcceptanceRate(Number(data.speculative_acceptance_rate ?? 0));
+                    setLatestTick(Number(data.event_tick ?? 0));
                     if (data.block_inspect_info) {
                         setBlocksMetadata(data.block_inspect_info);
                     }
@@ -71,63 +109,95 @@ export default function Home() {
         return () => clearInterval(interval);
     }, []);
 
+    // Replay a historical tick when the scrubber is active. Live mode never
+    // fabricates a replay: it simply uses the published metadata.
+    useEffect(() => {
+        if (scrubTick === null) {
+            setReplayBlocks(undefined);
+            return;
+        }
+        let cancelled = false;
+        const replay = async () => {
+            try {
+                const res = await fetch(`${ENGINE_URL}/v1/timetravel?tick=${scrubTick}`);
+                if (!res.ok) {
+                    if (!cancelled) setReplayBlocks(undefined);
+                    return;
+                }
+                const payload: ReplayPayload = await res.json();
+                if (!cancelled) {
+                    setReplayBlocks(applyReplay(payload.keyframe.blocks, payload.events));
+                }
+            } catch {
+                if (!cancelled) setReplayBlocks(undefined);
+            }
+        };
+        replay();
+        return () => {
+            cancelled = true;
+        };
+    }, [scrubTick]);
+
+    const consumeGenerationStream = async (response: Response) => {
+        if (!response.body) return;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const frames = buffer.split("\n\n");
+            buffer = frames.pop() ?? "";
+
+            for (const frame of frames) {
+                for (const line of frame.split("\n")) {
+                    if (!line.startsWith("data:")) continue;
+                    const rawJson = line.slice(5).trim();
+                    if (!rawJson || rawJson === "[DONE]") continue;
+                    try {
+                        const data = JSON.parse(rawJson);
+                        if (data.sequence_id !== undefined) setSequenceId(data.sequence_id);
+                        if (typeof data.token === "string") {
+                            setGeneratedText((prev) => prev + data.token);
+                        }
+                        setTokensPerSec(Number(data.tokens_per_sec ?? 0));
+                        setTtftMs(Number(data.ttft_ms ?? 0));
+                        setItlMs(Number(data.itl_ms ?? 0));
+                        setAllocatedBlocks(Number(data.allocated_blocks ?? 0));
+                        setTotalBlocks(Number(data.total_blocks ?? 512));
+                        setMemoryRatio(Number(data.memory_usage_ratio ?? 0));
+                        setPrefixCacheHitRatio(Number(data.prefix_cache_hit_ratio ?? 0));
+                        setAcceptanceRate(Number(data.speculative_acceptance_rate ?? 0));
+                        setLatestTick(Number(data.event_tick ?? 0));
+                        if (Array.isArray(data.active_block_ids)) {
+                            setActiveBlockIds(data.active_block_ids);
+                        }
+                        if (data.is_finished) {
+                            setIsGenerating(false);
+                        }
+                    } catch {
+                        // Ignore keep-alive or partial frames.
+                    }
+                }
+            }
+        }
+    };
+
     const startGenerationStream = async () => {
         if (isGenerating) return;
         setIsGenerating(true);
         setGeneratedText("");
 
         try {
-            const response = await fetch("http://127.0.0.1:8080/v1/generate/stream", {
+            const response = await fetch(`${ENGINE_URL}/v1/generate/stream`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt, max_tokens: maxTokens }),
+                body: JSON.stringify({ prompt, max_tokens: maxTokens, spec: true }),
             });
-
-            if (!response.body) {
-                setIsGenerating(false);
-                return;
-            }
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder("utf-8");
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split("\n");
-
-                for (const line of lines) {
-                    if (line.startsWith("data:")) {
-                        const rawJson = line.replace("data:", "").trim();
-                        if (!rawJson || rawJson === "[DONE]") continue;
-
-                        try {
-                            const data = JSON.parse(rawJson);
-                            setSequenceId(data.sequence_id);
-                            setGeneratedText((prev) => prev + data.token);
-                            setTokensPerSec(data.tokens_per_sec);
-                            setTtftMs(data.ttft_ms);
-                            setItlMs(data.itl_ms);
-                            setAllocatedBlocks(data.allocated_blocks);
-                            setTotalBlocks(data.total_blocks);
-                            setMemoryRatio(data.memory_usage_ratio);
-                            setPrefixCacheHitRatio(data.prefix_cache_hit_ratio);
-                            setAcceptanceRate(data.speculative_acceptance_rate);
-                            if (data.active_block_ids) {
-                                setActiveBlockIds(data.active_block_ids);
-                            }
-
-                            if (data.is_finished) {
-                                setIsGenerating(false);
-                            }
-                        } catch (e) {
-                            console.error("JSON parse error", e);
-                        }
-                    }
-                }
-            }
+            if (!response.ok) throw new Error(`engine returned ${response.status}`);
+            await consumeGenerationStream(response);
         } catch (err) {
             console.error("Failed to connect to NexusKV engine:", err);
             setEngineOnline(false);
@@ -136,6 +206,104 @@ export default function Home() {
             setIsGenerating(false);
         }
     };
+
+    const fetchTree = async (session = sessionName) => {
+        try {
+            const res = await fetch(`${ENGINE_URL}/v1/sessions/${encodeURIComponent(session)}/tree`);
+            if (!res.ok) return;
+            const data = await res.json();
+            setTreeNodes(Array.isArray(data.nodes) ? data.nodes : []);
+        } catch {
+            // Leave the previous tree visible when the engine is offline.
+        }
+    };
+
+    const commitCheckpoint = async () => {
+        if (sequenceId === undefined) {
+            setSessionError("Generate at least one token before committing a checkpoint.");
+            return;
+        }
+        setSessionBusy(true);
+        setSessionError("");
+        try {
+            const res = await fetch(`${ENGINE_URL}/v1/sessions/commit`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    session: sessionName,
+                    parent: null,
+                    label: `checkpoint-${sequenceId}`,
+                    seq: sequenceId,
+                }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error ?? `commit failed (${res.status})`);
+            setNodeId(Number(data.node));
+            await fetchTree();
+        } catch (err) {
+            setSessionError(err instanceof Error ? err.message : String(err));
+        } finally {
+            setSessionBusy(false);
+        }
+    };
+
+    const checkoutNode = async () => {
+        if (nodeId === null) return;
+        setSessionBusy(true);
+        setIsGenerating(true);
+        setSessionError("");
+        setGeneratedText("");
+        try {
+            const response = await fetch(`${ENGINE_URL}/v1/sessions/checkout`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    node: nodeId,
+                    max_tokens: maxTokens,
+                    temperature: 0.7,
+                    spec: true,
+                }),
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data.error ?? `checkout failed (${response.status})`);
+            }
+            await consumeGenerationStream(response);
+            await fetchTree();
+        } catch (err) {
+            setSessionError(err instanceof Error ? err.message : String(err));
+        } finally {
+            setIsGenerating(false);
+            setSessionBusy(false);
+        }
+    };
+
+    const forgetNode = async () => {
+        if (nodeId === null) return;
+        setSessionBusy(true);
+        setSessionError("");
+        try {
+            const res = await fetch(`${ENGINE_URL}/v1/sessions/forget`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ node: nodeId }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error ?? `forget failed (${res.status})`);
+            setNodeId(null);
+            await fetchTree();
+        } catch (err) {
+            setSessionError(err instanceof Error ? err.message : String(err));
+        } finally {
+            setSessionBusy(false);
+        }
+    };
+
+    const displayedBlocks = replayBlocks ?? blocksMetadata;
+    const replayAllocated = replayBlocks ? countAllocated(replayBlocks) : 0;
+    const displayedAllocated = replayBlocks ? replayAllocated : allocatedBlocks;
+    const displayedMemoryRatio =
+        replayBlocks && totalBlocks > 0 ? replayAllocated / totalBlocks : memoryRatio;
 
     return (
         <main className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-8">
@@ -153,7 +321,7 @@ export default function Home() {
                             </span>
                         </div>
                         <p className="text-xs text-slate-400 mt-1">
-                            Paged KV-Cache, Radix Prefix Caching &amp; Continuous Batching
+                            Paged KV-Cache, Radix Prefix Caching, Sessions &amp; Time Travel
                         </p>
                     </div>
 
@@ -191,21 +359,67 @@ export default function Home() {
                     tokensPerSec={tokensPerSec}
                     ttftMs={ttftMs}
                     itlMs={itlMs}
-                    allocatedBlocks={allocatedBlocks}
+                    allocatedBlocks={displayedAllocated}
                     totalBlocks={totalBlocks}
-                    memoryRatio={memoryRatio}
+                    memoryRatio={displayedMemoryRatio}
                     prefixCacheHitRatio={prefixCacheHitRatio}
                     acceptanceRate={acceptanceRate}
                 />
 
+                {/* Time-travel scrubber */}
+                <div className="bg-slate-900/90 border border-slate-800 p-5 rounded-2xl shadow-xl">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                        <div>
+                            <h3 className="text-white text-sm font-semibold tracking-wide flex items-center gap-2">
+                                <History className="w-4 h-4 text-cyan-400" />
+                                Flight Recorder · Time Travel
+                            </h3>
+                            <p className="text-xs text-slate-400 mt-0.5">
+                                {scrubTick === null
+                                    ? "Live allocator state (null scrub tick)"
+                                    : `Replaying keyframe + events up to tick ${scrubTick}`}
+                            </p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <span
+                                className={`px-2.5 py-1 rounded-full text-[11px] font-mono border ${
+                                    scrubTick === null
+                                        ? "bg-emerald-950/70 border-emerald-700 text-emerald-300"
+                                        : "bg-cyan-950/70 border-cyan-700 text-cyan-300"
+                                }`}
+                            >
+                                {scrubTick === null ? "LIVE" : `TICK ${scrubTick} / ${latestTick}`}
+                            </span>
+                            <button
+                                onClick={() => setScrubTick(null)}
+                                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors"
+                            >
+                                Return to Live
+                            </button>
+                        </div>
+                    </div>
+                    <input
+                        type="range"
+                        min={0}
+                        max={Math.max(0, latestTick)}
+                        value={scrubTick === null ? latestTick : Math.min(scrubTick, latestTick)}
+                        disabled={!engineOnline || latestTick === 0}
+                        onChange={(event) => setScrubTick(Number(event.target.value))}
+                        className="w-full mt-4 accent-cyan-500 disabled:opacity-40"
+                    />
+                    <p className="text-[11px] text-slate-500 mt-1 font-mono">
+                        Keyframes every 256 ticks · 50k-event ring buffer · scrubbing never fabricates state.
+                    </p>
+                </div>
+
                 {/* VRAM Physical Block Heatmap */}
                 <VramBlockCanvas
-                    allocatedBlocks={allocatedBlocks}
+                    allocatedBlocks={displayedAllocated}
                     totalBlocks={totalBlocks}
                     blockSize={blockSize}
-                    activeSequenceId={sequenceId}
-                    activeBlockIds={activeBlockIds}
-                    blocksMetadata={blocksMetadata}
+                    activeSequenceId={scrubTick === null ? sequenceId : undefined}
+                    activeBlockIds={scrubTick === null ? activeBlockIds : []}
+                    blocksMetadata={displayedBlocks}
                 />
 
                 {/* Generation Console & OpenAI API Playground */}
@@ -219,7 +433,7 @@ export default function Home() {
                                     Inference Prompt
                                 </label>
                                 <span className="text-[11px] font-mono text-slate-400">
-                                    Model: nexuskv-engine-v1
+                                    spec: on · adaptive K
                                 </span>
                             </div>
 
@@ -228,7 +442,7 @@ export default function Home() {
                                 onChange={(e) => setPrompt(e.target.value)}
                                 rows={4}
                                 className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-emerald-500 transition-colors placeholder:text-slate-600 font-sans"
-                                placeholder="Enter prompt to execute continuous speculative decoding..."
+                                placeholder="Enter a prompt to run continuous speculative decoding..."
                             />
 
                             <div className="flex items-center justify-between text-xs text-slate-400 pt-1">
@@ -257,7 +471,7 @@ export default function Home() {
                                     </>
                                 ) : (
                                     <>
-                                        <Play className="w-4 h-4 fill-white" /> Trigger Speculative Stream
+                                        <Play className="w-4 h-4 fill-white" /> Generate with Speculation
                                     </>
                                 )}
                             </button>
@@ -278,13 +492,99 @@ export default function Home() {
                             )}
                         </div>
 
-                        <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-sm text-emerald-300/90 overflow-y-auto max-h-[170px] min-h-[120px] whitespace-pre-wrap leading-relaxed">
+                        <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-sm text-emerald-300/90 overflow-y-auto max-h-[210px] min-h-[140px] whitespace-pre-wrap leading-relaxed">
                             {generatedText || (
                                 <span className="text-slate-600 italic">
                                     Token output stream and real-time physical VRAM block mappings will stream here...
                                 </span>
                             )}
                         </div>
+                    </div>
+                </div>
+
+                {/* Git-for-KV sessions */}
+                <div className="bg-slate-900/90 border border-slate-800 p-5 rounded-2xl shadow-xl">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                        <div>
+                            <h3 className="text-white text-sm font-semibold tracking-wide flex items-center gap-2">
+                                <GitBranch className="w-4 h-4 text-violet-400" />
+                                Git-for-KV Sessions
+                            </h3>
+                            <p className="text-xs text-slate-400 mt-0.5">
+                                Commit pins the full-block KV prefix; checkout resumes it in O(1) and branches independently.
+                            </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <input
+                                value={sessionName}
+                                onChange={(event) => {
+                                    setSessionName(event.target.value);
+                                    setNodeId(null);
+                                    setTreeNodes([]);
+                                }}
+                                className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs font-mono w-32 focus:outline-none focus:border-violet-500"
+                                aria-label="Session name"
+                            />
+                            <button
+                                onClick={commitCheckpoint}
+                                disabled={isGenerating || sequenceId === undefined || sessionBusy}
+                                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-violet-700 hover:bg-violet-600 disabled:bg-slate-800 disabled:text-slate-500 transition-colors"
+                            >
+                                Commit
+                            </button>
+                            <button
+                                onClick={checkoutNode}
+                                disabled={nodeId === null || sessionBusy}
+                                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-700 hover:bg-cyan-600 disabled:bg-slate-800 disabled:text-slate-500 transition-colors"
+                            >
+                                Checkout
+                            </button>
+                            <button
+                                onClick={forgetNode}
+                                disabled={nodeId === null || sessionBusy}
+                                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:text-slate-500 transition-colors"
+                            >
+                                Forget
+                            </button>
+                        </div>
+                    </div>
+
+                    {sessionError && (
+                        <p className="mt-3 text-xs text-rose-300 font-mono border border-rose-900/60 bg-rose-950/30 rounded-lg px-3 py-2">
+                            {sessionError}
+                        </p>
+                    )}
+
+                    <div className="mt-4">
+                        {treeNodes.length === 0 ? (
+                            <p className="text-xs text-slate-500 italic">
+                                No checkpoints in this session. Run a generation with max-tokens above 1, then Commit.
+                            </p>
+                        ) : (
+                            <div className="space-y-1 font-mono text-xs">
+                                {treeNodes.map((node) => (
+                                    <button
+                                        key={node.id}
+                                        onClick={() => setNodeId(node.id)}
+                                        style={{ marginLeft: `${nodeDepth(node, treeNodes) * 18}px` }}
+                                        className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+                                            nodeId === node.id
+                                                ? "border-violet-600 bg-violet-950/40 text-violet-200"
+                                                : "border-slate-800 bg-slate-950/60 text-slate-300 hover:border-slate-700"
+                                        }`}
+                                    >
+                                        <span className="text-violet-400">#{node.id}</span>{" "}
+                                        <span>{node.label}</span>
+                                        <span className="text-slate-500">
+                                            {" "}· {node.tokens} tokens · {node.pinned_blocks} pinned blocks
+                                        </span>
+                                        {node.parent !== null && (
+                                            <span className="text-slate-600"> · parent #{node.parent}</span>
+                                        )}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>

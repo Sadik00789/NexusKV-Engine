@@ -1,6 +1,7 @@
 // src/server/routes.rs
 use super::sse_handler::{
-    AppState, chat_completions, get_metrics, health_check, list_models, stream_generation,
+    AppState, chat_completions, checkout_session, commit_session, forget_session, get_metrics,
+    health_check, list_models, session_tree, stream_generation, timetravel,
 };
 use axum::{
     Router,
@@ -21,6 +22,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/metrics", get(get_metrics))
         .route("/v1/generate/stream", post(stream_generation))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/sessions/commit", post(commit_session))
+        .route("/v1/sessions/checkout", post(checkout_session))
+        .route("/v1/sessions/forget", post(forget_session))
+        .route("/v1/sessions/:id/tree", get(session_tree))
+        .route("/v1/timetravel", get(timetravel))
         .layer(cors)
         .with_state(state)
 }
