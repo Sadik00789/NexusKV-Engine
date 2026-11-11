@@ -23,8 +23,9 @@ handlers relay measured telemetry to clients and the dashboard.
 > **Measurement policy.** The default `cargo run` starts a deterministic **mock
 > executor**. Mock mode is logged at startup, reported as `"executor": "mock"`
 > by `/v1/models` and `/v1/metrics`, and shown as a MOCK banner in the
-> dashboard. Real dense Qwen inference requires the `candle-model` feature; the
-> custom CUDA kernel requires `cuda`. Allocator microbenchmarks and mock-mode
+> dashboard. Real dense Qwen inference runs on CPU with the `candle-model`
+> feature or on an NVIDIA GPU with `cuda`; the custom CUDA kernel is part of the
+> GPU path. Allocator microbenchmarks and mock-mode
 > token rates are never presented as inference throughput. Every benchmark in
 > this document names its hardware, model, executor mode, and metric.
 
@@ -74,18 +75,19 @@ measured live performance values; only allocator state is replayed:
 | Sessions | Commit pins full-block KV prefixes, checkout resumes in O(1) and branches independently, forget releases pins |
 | Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, `GET /v1/timetravel?tick=N` |
 | Tiering | Content-addressed host LRU plus NVMe spill, demand page-in on `Swapped` trie hits, fault-injection coverage, NKV2 dtype-tagged spill files |
-| Real model | Dense Qwen3-0.6B (primary) and Qwen2.5-0.5B-Instruct (fallback) behind `candle-model`; f16 CUDA weights and KV pools, f32 norm/softmax accumulation, QK-norm, GQA, RoPE, SwiGLU |
+| Real model | Dense Qwen3-0.6B (primary) and Qwen2.5-0.5B-Instruct (fallback) behind `candle-model` on CPU (f32) or `cuda` on GPU (f16); QK-norm, GQA, RoPE, SwiGLU, f32 norm/softmax accumulation |
 | CUDA | f16 `paged_decode_attention` with f32 accumulation and GQA-correct head mapping, enabled for decode by `NEXUSKV_CUDA_ATTENTION=1`, launched on candle's stream with automatic gather fallback; plus `reshape_and_cache` and `copy_block` |
 | Prefix hits | KV-valid trie blocks skip prefill compute; a block-aligned full re-hit computes zero prefill tokens (measured `prefill_tokens` / `prefix_skip_tokens`) |
-| Default build | CPU-only: no GPU, CUDA toolkit, or model weights required; the full test suite passes |
+| Execution targets | CPU and NVIDIA GPU: `candle-model` runs dense Qwen on CPU; `cuda` adds the GPU backend and custom decode kernel |
+| Default build | Mock executor; `cargo test` passes without a GPU, CUDA toolkit, or model weights |
 
 ### Feature flags
 
 | Feature set | What it enables |
 | --- | --- |
 | `default` | Mock executor, memory/scheduler/session engine, HTTP/SSE server, CPU attention reference |
-| `candle-model` | Dense Qwen3/Qwen2 execution through candle, f16 on CUDA and f32 on CPU |
-| `cuda` | Implies `candle-model`; enables candle's CUDA backend and compiles `csrc/paged_attention.cu` with nvcc |
+| `candle-model` | Dense Qwen3/Qwen2 inference on CPU through candle (f32 weights and KV pools) |
+| `cuda` | Implies `candle-model`; runs inference on an NVIDIA GPU (f16 weights and KV pools), enables candle's CUDA backend, and compiles `csrc/paged_attention.cu` with nvcc; falls back to CPU if no CUDA device is available |
 
 ### Target hardware and defaults
 
@@ -102,10 +104,11 @@ and 8 GB system RAM on native Windows 11** (no WSL):
 - f16 KV pool ≈ 344 MB
 - Tier host budget defaults to `512 MiB`
 
-CUDA f16 is the default. `NEXUSKV_DTYPE=f32` forces f32 and automatically clamps
-the pool to 96 blocks and 4 sequences with a warning. On 8 GB hosts, build with
-`CARGO_BUILD_JOBS=2` (already set in `.cargo/config.toml`) to avoid OOM while
-compiling candle.
+The same block and sequence defaults apply to both backends. On CUDA, f16 is the
+default; `NEXUSKV_DTYPE=f32` forces f32 and automatically clamps the pool to 96
+blocks and 4 sequences with a warning. CPU builds always use f32. On 8 GB hosts,
+build with `CARGO_BUILD_JOBS=2` (already set in `.cargo/config.toml`) to avoid
+OOM while compiling candle.
 
 Native Windows setup, PowerShell build/run/test scripts, and the system-memory
 fallback note live in [WINDOWS_SETUP.md](WINDOWS_SETUP.md).
@@ -220,14 +223,24 @@ pnpm dev          # http://localhost:3000
 Mock mode is deterministic and explicitly labeled. It is intended for memory,
 scheduler, and session testing, and is never presented as model inference.
 
-### Real dense Qwen inference
+### Real dense Qwen inference (CPU or GPU)
 
 ```bash
 # Primary target: Qwen/Qwen3-0.6B (dense, 28 layers, 8 KV heads, head_dim 128)
 # Fallback: Qwen/Qwen2.5-0.5B-Instruct
 export CARGO_BUILD_JOBS=2
+
+# CPU backend
 cargo run --release --features candle-model -- --model /path/to/Qwen3-0.6B
+
+# NVIDIA GPU backend (requires an MSVC host toolchain and CUDA 12.6)
+cargo run --release --features cuda -- --model /path/to/Qwen3-0.6B
 ```
+
+`candle-model` selects the CPU device; `cuda` selects the GPU and is the only
+feature set that compiles the custom kernel. With `cuda`, a missing CUDA device
+falls back to CPU with a warning. On Windows, use
+`scripts/build_windows.ps1` and `scripts/run_windows.ps1`.
 
 The model directory must contain `config.json`, `tokenizer.json`, and at least
 one `*.safetensors` shard. Split checkpoints are loaded one shard at a time; a
