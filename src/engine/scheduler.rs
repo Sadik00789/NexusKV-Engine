@@ -40,6 +40,9 @@ pub struct Seq {
     pub last_token_at: Option<Instant>,
     pub tx: UnboundedSender<TokenMsg>,
     pub spec: bool,
+    /// A checkout sequence already owns a page table attached by the session
+    /// store. Admission must not re-run prefix matching for it.
+    pub attached: bool,
     pub rng_state: u64,
 }
 
@@ -70,6 +73,7 @@ impl Seq {
             last_token_at: None,
             tx,
             spec,
+            attached: false,
             rng_state,
         }
     }
@@ -107,6 +111,9 @@ pub struct PrefillChunk {
 pub struct Batch {
     pub prefill: Vec<PrefillChunk>,
     pub decode: Vec<SeqId>,
+    /// Sequences preempted while building this batch. The actor resets their
+    /// drafters and the batch entries for them were already removed.
+    pub preempted: Vec<SeqId>,
 }
 
 impl Batch {
@@ -153,6 +160,14 @@ impl Scheduler {
 
     pub fn submit(&mut self, seq: Seq) {
         self.waiting.push_back(seq);
+    }
+
+    /// Checkout sequences already own an attached page table, so they skip
+    /// prefix matching on admission. They are queued at the front to preserve
+    /// the cheap-resume path.
+    pub fn submit_checkout(&mut self, seq: Seq) {
+        debug_assert!(seq.attached, "checkout sequences must be pre-attached");
+        self.waiting.push_front(seq);
     }
 
     pub fn schedule(&mut self, block_manager: &mut BlockSpaceManager) -> Batch {
@@ -204,16 +219,27 @@ impl Scheduler {
             let mut seq = self.waiting.pop_front().expect("checked non-empty");
             let seq_id = seq.id;
             let prompt_len = seq.prompt.len();
-            match block_manager.match_or_allocate_prefix(seq_id, &seq.prompt) {
-                Ok(_) => {
-                    seq.computed = 0;
+            let admission = if seq.attached {
+                Ok(())
+            } else {
+                block_manager
+                    .match_or_allocate_prefix(seq_id, &seq.prompt)
+                    .map(|_| ())
+            };
+            match admission {
+                Ok(()) => {
+                    if !seq.attached {
+                        seq.computed = 0;
+                    }
+                    let computed = seq.computed;
                     self.order.push_back(seq_id);
                     self.running.insert(seq_id, seq);
-                    if prompt_len > 0 {
-                        let len = prompt_len.min(budget);
+                    let remaining = prompt_len.saturating_sub(computed);
+                    if remaining > 0 {
+                        let len = remaining.min(budget);
                         batch.prefill.push(PrefillChunk {
                             seq: seq_id,
-                            start: 0,
+                            start: computed,
                             len,
                         });
                         budget -= len;
@@ -223,6 +249,7 @@ impl Scheduler {
                     if let Some(victim) = self.preempt_newest(block_manager) {
                         batch.decode.retain(|id| *id != victim);
                         batch.prefill.retain(|chunk| chunk.seq != victim);
+                        batch.preempted.push(victim);
                         self.preemptions += 1;
                         self.waiting.push_front(seq);
                         continue;
@@ -261,6 +288,7 @@ impl Scheduler {
         let _ = block_manager.free_sequence(victim);
         seq.computed = 0;
         seq.out.clear();
+        seq.attached = false;
         seq.first_token_at = None;
         seq.last_token_at = None;
         self.waiting.push_front(seq);

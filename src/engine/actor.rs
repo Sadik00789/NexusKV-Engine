@@ -1,13 +1,20 @@
 // src/engine/actor.rs
 use super::scheduler::{Batch, FinishReason, PrefillChunk, Scheduler, Seq};
-use super::speculative::SpecStats;
-use crate::memory::{BlockId, BlockInspectInfo, BlockSpaceManager, SeqId};
+use super::session::{SessionStore, SessionTree};
+use super::speculative::{
+    AdaptiveK, DRAFT_NGRAM, LookupDrafter, SpecRng, SpecStats, probabilities, sample_from_logits,
+    verify_greedy, verify_sampled,
+};
+use crate::memory::{
+    BlockId, BlockInspectInfo, BlockSpaceManager, FlightRecorder, MemoryError, SeqId,
+};
 use crate::model::{Executor, Tokenizer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub enum TokenMsg {
@@ -27,10 +34,30 @@ pub struct GenerateJob {
     pub tx: UnboundedSender<TokenMsg>,
 }
 
-#[derive(Debug)]
 pub enum Request {
     Generate(GenerateJob),
-    Abort { seq: SeqId },
+    Abort {
+        seq: SeqId,
+    },
+    Commit {
+        session: String,
+        parent: Option<u64>,
+        label: String,
+        seq: SeqId,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    Checkout {
+        node: u64,
+        job: GenerateJob,
+    },
+    Forget {
+        node: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SessionTree {
+        session: String,
+        reply: oneshot::Sender<SessionTree>,
+    },
 }
 
 /// Telemetry published by the actor after every iteration.
@@ -54,14 +81,21 @@ pub struct Snapshot {
     pub prefix_cache_hits: u64,
     pub speculative_acceptance_rate: f64,
     pub acceptance: f64,
+    pub speculative_proposed: u64,
+    pub speculative_accepted: u64,
     pub adaptive_k: usize,
     pub tokens_per_sec: f64,
     pub ttft_p50_ms: f64,
     pub evictions: u64,
     pub page_faults: u64,
     pub cow_copies: u64,
+    pub swapped_out: u64,
+    pub swapped_in: u64,
+    pub disk_spills: u64,
+    pub disk_loads: u64,
     pub preemptions: u64,
     pub total_tokens_generated: u64,
+    pub event_tick: u64,
     pub active_sequence_ids: Vec<SeqId>,
     pub seq_blocks: HashMap<SeqId, Vec<BlockId>>,
     pub block_inspect_info: Vec<BlockInspectInfo>,
@@ -88,14 +122,21 @@ impl Snapshot {
             prefix_cache_hits: 0,
             speculative_acceptance_rate: 0.0,
             acceptance: 0.0,
+            speculative_proposed: 0,
+            speculative_accepted: 0,
             adaptive_k: 0,
             tokens_per_sec: 0.0,
             ttft_p50_ms: 0.0,
             evictions: 0,
             page_faults: 0,
             cow_copies: 0,
+            swapped_out: 0,
+            swapped_in: 0,
+            disk_spills: 0,
+            disk_loads: 0,
             preemptions: 0,
             total_tokens_generated: 0,
+            event_tick: 0,
             active_sequence_ids: Vec::new(),
             seq_blocks: HashMap::new(),
             block_inspect_info: Vec::new(),
@@ -141,6 +182,12 @@ impl ThroughputWindow {
     }
 }
 
+/// Handles the actor uses to publish telemetry and flight-recorder keyframes.
+pub struct TelemetrySink {
+    pub snapshot: Arc<Mutex<Snapshot>>,
+    pub recorder: Arc<Mutex<FlightRecorder>>,
+}
+
 pub struct EngineActor {
     rx: UnboundedReceiver<Request>,
     scheduler: Scheduler,
@@ -149,6 +196,10 @@ pub struct EngineActor {
     tokenizer: Arc<dyn Tokenizer>,
     snapshot: Arc<Mutex<Snapshot>>,
     spec_stats: SpecStats,
+    bandit: AdaptiveK,
+    drafters: HashMap<SeqId, LookupDrafter>,
+    sessions: SessionStore,
+    recorder: Arc<Mutex<FlightRecorder>>,
     throughput: ThroughputWindow,
     ttfts: VecDeque<f64>,
     total_tokens: u64,
@@ -162,7 +213,7 @@ impl EngineActor {
         block_manager: BlockSpaceManager,
         executor: Box<dyn Executor>,
         tokenizer: Arc<dyn Tokenizer>,
-        snapshot: Arc<Mutex<Snapshot>>,
+        telemetry: TelemetrySink,
         model_id: String,
     ) -> Self {
         Self {
@@ -171,8 +222,12 @@ impl EngineActor {
             block_manager,
             executor,
             tokenizer,
-            snapshot,
+            snapshot: telemetry.snapshot,
             spec_stats: SpecStats::default(),
+            bandit: AdaptiveK::new(),
+            drafters: HashMap::new(),
+            sessions: SessionStore::new(),
+            recorder: telemetry.recorder,
             throughput: ThroughputWindow::new(),
             ttfts: VecDeque::new(),
             total_tokens: 0,
@@ -181,6 +236,8 @@ impl EngineActor {
     }
 
     pub fn run(mut self) {
+        // Keyframe the empty allocator so time-travel can replay from tick 0.
+        self.publish();
         loop {
             let mut disconnected = false;
             loop {
@@ -201,6 +258,13 @@ impl EngineActor {
 
             let batch = self.scheduler.schedule(&mut self.block_manager);
             if !batch.is_empty() {
+                for seq_id in &batch.preempted {
+                    if let Some(seq) = self.scheduler.seq(*seq_id) {
+                        let mut drafter = LookupDrafter::new(DRAFT_NGRAM);
+                        drafter.observe(&seq.prompt);
+                        self.drafters.insert(*seq_id, drafter);
+                    }
+                }
                 let produced = self.execute_batch(&batch);
                 if produced > 0 {
                     self.throughput.push(produced);
@@ -250,6 +314,9 @@ impl EngineActor {
                     });
                     return;
                 }
+                let mut drafter = LookupDrafter::new(DRAFT_NGRAM);
+                drafter.observe(&job.prompt);
+                self.drafters.insert(job.seq, drafter);
                 let seq = Seq::new(
                     job.seq,
                     job.prompt,
@@ -262,11 +329,83 @@ impl EngineActor {
                 self.scheduler.submit(seq);
             }
             Request::Abort { seq } => {
+                self.drafters.remove(&seq);
                 if let Some(seq) = self.scheduler.abort(seq, &mut self.block_manager) {
                     let _ = seq.tx.send(TokenMsg::Done {
                         reason: FinishReason::Aborted,
                     });
                 }
+            }
+            Request::Commit {
+                session,
+                parent,
+                label,
+                seq,
+                reply,
+            } => {
+                let tokens = match self.scheduler.seq(seq) {
+                    Some(seq) => {
+                        let mut tokens = seq.prompt.clone();
+                        tokens.extend_from_slice(&seq.out);
+                        tokens
+                    }
+                    None => {
+                        let _ = reply.send(Err(format!("sequence {seq} is not resident")));
+                        return;
+                    }
+                };
+                let result = self.sessions.commit(
+                    &session,
+                    parent,
+                    &label,
+                    seq,
+                    tokens,
+                    &mut self.block_manager,
+                );
+                let _ = reply.send(result);
+            }
+            Request::Checkout { node, job } => {
+                if self.scheduler.contains(job.seq) {
+                    let _ = job.tx.send(TokenMsg::Error {
+                        message: format!("duplicate sequence id {}", job.seq),
+                    });
+                    return;
+                }
+                match self
+                    .sessions
+                    .checkout(node, job.seq, &mut self.block_manager)
+                {
+                    Ok(snapshot) => {
+                        let mut drafter = LookupDrafter::new(DRAFT_NGRAM);
+                        drafter.observe(&snapshot.tokens);
+                        self.drafters.insert(job.seq, drafter);
+                        let mut seq = Seq::new(
+                            job.seq,
+                            snapshot.tokens,
+                            job.max_tokens,
+                            job.temperature,
+                            job.top_p,
+                            job.tx,
+                            job.spec,
+                        );
+                        seq.computed = snapshot.computed;
+                        seq.attached = true;
+                        self.scheduler.submit_checkout(seq);
+                    }
+                    Err(error) => {
+                        let _ = job.tx.send(TokenMsg::Error { message: error });
+                        let _ = job.tx.send(TokenMsg::Done {
+                            reason: FinishReason::Error,
+                        });
+                    }
+                }
+            }
+            Request::Forget { node, reply } => {
+                let result = self.sessions.forget(node, &mut self.block_manager);
+                let _ = reply.send(result);
+            }
+            Request::SessionTree { session, reply } => {
+                let _ = reply.send(self.sessions.tree(&session));
             }
         }
     }
@@ -327,21 +466,42 @@ impl EngineActor {
         }
 
         let last_logits = logits.pop().unwrap_or_default();
-        let mut rng = self
+        let mut rng = SpecRng::new(
+            self.scheduler
+                .seq(seq_id)
+                .map(|seq| seq.rng_state)
+                .unwrap_or(1),
+        );
+        let token = sample_from_logits(&last_logits, temperature, top_p, &mut rng);
+        if let Some(seq) = self.scheduler.seq_mut(seq_id) {
+            seq.rng_state = rng.state();
+        }
+        if let Err(err) = self.block_manager.append_tokens(seq_id, 1) {
+            self.fail_seq(seq_id, format!("KV allocation failed: {err}"));
+            return 0;
+        }
+        self.apply_pending_copies();
+        let eos = self.emit_token(seq_id, token);
+        let maxed = self
             .scheduler
             .seq(seq_id)
-            .map(|seq| seq.rng_state)
-            .unwrap_or(1);
-        let token = sample_token(&last_logits, temperature, top_p, &mut rng);
-        if let Some(seq) = self.scheduler.seq_mut(seq_id) {
-            seq.rng_state = rng;
+            .map(|seq| seq.out.len() >= seq.max_tokens)
+            .unwrap_or(false);
+        let reason = if eos {
+            Some(FinishReason::StopTokenEncountered)
+        } else if maxed {
+            Some(FinishReason::MaxTokensReached)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.finish_sequence(seq_id, reason);
         }
-        self.emit_token(seq_id, token);
         1
     }
 
     fn run_decode(&mut self, seq_id: SeqId) -> usize {
-        let (last_token, start, temperature, top_p) = {
+        let (last_token, start, temperature, top_p, spec, prompt_len, out_len) = {
             let Some(seq) = self.scheduler.seq(seq_id) else {
                 return 0;
             };
@@ -351,82 +511,185 @@ impl EngineActor {
             let Some(&last) = seq.out.last() else {
                 return 0;
             };
-            (last, seq.computed, seq.temperature, seq.top_p)
+            (
+                last,
+                seq.computed,
+                seq.temperature,
+                seq.top_p,
+                seq.spec,
+                seq.prompt.len(),
+                seq.out.len(),
+            )
         };
 
-        let mut logits = match self.executor.forward(
-            &mut self.block_manager,
-            seq_id,
-            &[last_token],
-            start,
-            false,
-        ) {
-            Ok(logits) => logits,
+        let selected_k = if spec { self.bandit.select() } else { 0 };
+        let mut drafts = if selected_k > 0 {
+            self.drafters
+                .get(&seq_id)
+                .map(|drafter| drafter.propose(selected_k))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Drafts must fit the per-sequence page-table capacity. The pool itself
+        // may still reject the append; that falls back to a plain decode below.
+        let capacity = self.block_manager.max_blocks_per_seq * self.block_manager.block_size;
+        let available = capacity.saturating_sub(prompt_len + out_len);
+        if available <= 1 {
+            drafts.clear();
+        } else {
+            drafts.truncate(available - 1);
+        }
+
+        let mut input = Vec::with_capacity(drafts.len() + 1);
+        input.push(last_token);
+        input.extend_from_slice(&drafts);
+        loop {
+            match self.block_manager.append_tokens(seq_id, input.len()) {
+                Ok(()) => break,
+                Err(MemoryError::OutOfMemory) | Err(MemoryError::CapacityExceeded)
+                    if input.len() > 1 =>
+                {
+                    input.truncate(1);
+                }
+                Err(err) => {
+                    self.fail_seq(seq_id, format!("KV allocation failed: {err}"));
+                    return 0;
+                }
+            }
+        }
+        let drafts = &input[1..];
+
+        let started = Instant::now();
+        let logits =
+            match self
+                .executor
+                .forward(&mut self.block_manager, seq_id, &input, start, true)
+            {
+                Ok(logits) => logits,
+                Err(err) => {
+                    self.fail_seq(seq_id, format!("decode forward failed: {err}"));
+                    return 0;
+                }
+            };
+        self.apply_pending_copies();
+
+        let mut rng = SpecRng::new(
+            self.scheduler
+                .seq(seq_id)
+                .map(|seq| seq.rng_state)
+                .unwrap_or(1),
+        );
+        let verification = if temperature <= 1e-3 {
+            verify_greedy(&logits, drafts)
+        } else {
+            let target: Vec<Vec<f64>> = logits
+                .iter()
+                .map(|row| probabilities(row, temperature, top_p))
+                .collect();
+            verify_sampled(&target, drafts, &mut rng)
+        };
+        let verification = match verification {
+            Ok(verification) => verification,
             Err(err) => {
-                self.fail_seq(seq_id, format!("decode forward failed: {err}"));
+                self.fail_seq(seq_id, format!("speculative verification failed: {err}"));
                 return 0;
             }
         };
-        self.apply_pending_copies();
+        let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0).max(1e-6);
 
-        let mut rng = {
-            let Some(seq) = self.scheduler.seq_mut(seq_id) else {
-                return 0;
-            };
-            seq.computed += 1;
-            seq.rng_state
-        };
-        let last_logits = logits.pop().unwrap_or_default();
-        let token = sample_token(&last_logits, temperature, top_p, &mut rng);
+        if spec {
+            self.spec_stats
+                .record_step(drafts.len(), verification.accepted);
+            let reward = verification.accepted as f64 / elapsed_ms;
+            self.bandit.update(selected_k, reward);
+            self.spec_stats.adaptive_k = self.bandit.current_k();
+        }
+
+        let remaining = self
+            .scheduler
+            .seq(seq_id)
+            .map(|seq| seq.max_tokens.saturating_sub(seq.out.len()))
+            .unwrap_or(0);
+        let mut emitted = 0usize;
+        let mut eos = false;
+        for &token in &verification.tokens {
+            if emitted >= remaining {
+                break;
+            }
+            eos = self.emit_token(seq_id, token);
+            emitted += 1;
+            if eos {
+                break;
+            }
+        }
+        if emitted > 0
+            && let Some(drafter) = self.drafters.get_mut(&seq_id)
+        {
+            drafter.observe(&verification.tokens[..emitted]);
+        }
+
+        if let Err(err) = self
+            .block_manager
+            .rollback(seq_id, prompt_len + out_len + emitted)
+        {
+            self.fail_seq(seq_id, format!("speculative rollback failed: {err}"));
+            return 0;
+        }
+        let kv_valid = start + 1 + verification.accepted;
+        let logical_after = prompt_len + out_len + emitted;
         if let Some(seq) = self.scheduler.seq_mut(seq_id) {
-            seq.rng_state = rng;
+            seq.computed = kv_valid.min(logical_after.saturating_sub(1));
+            seq.rng_state = rng.state();
         }
-        self.emit_token(seq_id, token);
-        1
-    }
 
-    fn emit_token(&mut self, seq_id: SeqId, token: u32) {
-        let now = Instant::now();
-        let (step, max_tokens) = {
-            let Some(seq) = self.scheduler.seq_mut(seq_id) else {
-                return;
-            };
-            if seq.first_token_at.is_none() {
-                seq.first_token_at = Some(now);
-            }
-            seq.last_token_at = Some(now);
-            seq.out.push(token);
-            (seq.out.len(), seq.max_tokens)
-        };
-
-        if let Err(err) = self.block_manager.append_tokens(seq_id, 1) {
-            self.fail_seq(seq_id, format!("KV allocation failed: {err}"));
-            return;
-        }
-        self.apply_pending_copies();
-        self.total_tokens += 1;
-
-        let text = self.tokenizer.decode(&[token]);
-        let is_eos = self.tokenizer.eos_token_ids().contains(&token);
-        let finished_reason = if is_eos {
+        let maxed = self
+            .scheduler
+            .seq(seq_id)
+            .map(|seq| seq.out.len() >= seq.max_tokens)
+            .unwrap_or(false);
+        let reason = if eos {
             Some(FinishReason::StopTokenEncountered)
-        } else if step >= max_tokens {
+        } else if maxed {
             Some(FinishReason::MaxTokensReached)
         } else {
             None
         };
-
-        if let Some(seq) = self.scheduler.seq(seq_id) {
-            let _ = seq.tx.send(TokenMsg::Token {
-                text,
-                id: token,
-                step,
-            });
+        if let Some(reason) = reason {
+            self.finish_sequence(seq_id, reason);
         }
+        emitted
+    }
 
-        if let Some(reason) = finished_reason
-            && let Some(seq) = self.scheduler.finish(seq_id, &mut self.block_manager)
-        {
+    /// Push one committed token into the sequence and notify the client.
+    /// Returns whether the token is an end-of-sequence marker. KV allocation is
+    /// the caller's responsibility because speculative steps batch it.
+    fn emit_token(&mut self, seq_id: SeqId, token: u32) -> bool {
+        let now = Instant::now();
+        let Some(seq) = self.scheduler.seq_mut(seq_id) else {
+            return false;
+        };
+        if seq.first_token_at.is_none() {
+            seq.first_token_at = Some(now);
+        }
+        seq.last_token_at = Some(now);
+        seq.out.push(token);
+        let step = seq.out.len();
+        self.total_tokens += 1;
+
+        let text = self.tokenizer.decode(&[token]);
+        let is_eos = self.tokenizer.eos_token_ids().contains(&token);
+        let _ = seq.tx.send(TokenMsg::Token {
+            text,
+            id: token,
+            step,
+        });
+        is_eos
+    }
+
+    fn finish_sequence(&mut self, seq_id: SeqId, reason: FinishReason) {
+        if let Some(seq) = self.scheduler.finish(seq_id, &mut self.block_manager) {
             if let Some(ttft) = seq.ttft() {
                 self.ttfts.push_back(ttft);
                 while self.ttfts.len() > 512 {
@@ -435,9 +698,11 @@ impl EngineActor {
             }
             let _ = seq.tx.send(TokenMsg::Done { reason });
         }
+        self.drafters.remove(&seq_id);
     }
 
     fn fail_seq(&mut self, seq_id: SeqId, message: String) {
+        self.drafters.remove(&seq_id);
         if let Some(seq) = self.scheduler.abort(seq_id, &mut self.block_manager) {
             let _ = seq.tx.send(TokenMsg::Error { message });
             let _ = seq.tx.send(TokenMsg::Done {
@@ -459,6 +724,7 @@ impl EngineActor {
         self.throughput.prune(now);
         let tps = self.throughput.tokens_per_sec(now);
         let stats = self.block_manager.stats();
+        let io_stats = self.block_manager.io_stats();
         let mut ttfts: Vec<f64> = self.ttfts.iter().copied().collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_p50 = if ttfts.is_empty() {
@@ -476,6 +742,11 @@ impl EngineActor {
         let total = self.block_manager.total_blocks;
         let ratio = self.block_manager.memory_usage_ratio();
         let acceptance = self.spec_stats.acceptance();
+        let event_tick = self.block_manager.event_tick();
+        let inspect = self.block_manager.inspect();
+        if let Ok(mut recorder) = self.recorder.lock() {
+            recorder.maybe_keyframe(event_tick, inspect.clone());
+        }
 
         let snapshot = Snapshot {
             executor: self.executor.name().to_string(),
@@ -496,105 +767,29 @@ impl EngineActor {
             prefix_cache_hits: stats.hits,
             speculative_acceptance_rate: acceptance,
             acceptance,
+            speculative_proposed: self.spec_stats.proposed,
+            speculative_accepted: self.spec_stats.accepted,
             adaptive_k: self.spec_stats.adaptive_k,
             tokens_per_sec: tps,
             ttft_p50_ms: ttft_p50,
             evictions: stats.evictions,
             page_faults: stats.page_faults,
             cow_copies: stats.cow_copies,
+            swapped_out: io_stats.swapped_out,
+            swapped_in: io_stats.swapped_in,
+            disk_spills: io_stats.disk_spills,
+            disk_loads: io_stats.disk_loads,
             preemptions: self.scheduler.preemptions,
             total_tokens_generated: self.total_tokens,
+            event_tick,
             active_sequence_ids,
             seq_blocks,
-            block_inspect_info: self.block_manager.inspect(),
+            block_inspect_info: inspect,
         };
         let mut guard = self
             .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = snapshot;
-    }
-}
-
-fn sample_token(logits: &[f32], temperature: f32, top_p: f32, rng: &mut u64) -> u32 {
-    if logits.is_empty() {
-        return 0;
-    }
-    if temperature <= 1e-3 {
-        let mut best = 0usize;
-        for index in 1..logits.len() {
-            if logits[index] > logits[best] {
-                best = index;
-            }
-        }
-        return best as u32;
-    }
-
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut probabilities: Vec<f64> = logits
-        .iter()
-        .map(|logit| ((*logit - max) as f64 / temperature as f64).exp())
-        .collect();
-    let sum: f64 = probabilities.iter().sum();
-    if !sum.is_finite() || sum <= 0.0 {
-        return 0;
-    }
-    for probability in &mut probabilities {
-        *probability /= sum;
-    }
-
-    let mut ranked: Vec<(usize, f64)> = probabilities.into_iter().enumerate().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let top_p = top_p.clamp(1e-6, 1.0) as f64;
-    let mut cumulative = 0.0;
-    let mut cutoff = ranked.len();
-    for (index, (_, probability)) in ranked.iter().enumerate() {
-        cumulative += probability;
-        if cumulative >= top_p {
-            cutoff = index + 1;
-            break;
-        }
-    }
-    let total: f64 = ranked[..cutoff]
-        .iter()
-        .map(|(_, probability)| probability)
-        .sum();
-    let sample = next_unit(rng) * total;
-    let mut accumulated = 0.0;
-    for (index, probability) in &ranked[..cutoff] {
-        accumulated += probability;
-        if sample < accumulated {
-            return *index as u32;
-        }
-    }
-    ranked[cutoff.saturating_sub(1)].0 as u32
-}
-
-fn next_unit(rng: &mut u64) -> f64 {
-    *rng = rng
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    ((*rng >> 11) as f64) / ((1u64 << 53) as f64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn greedy_sampling_is_argmax_and_deterministic() {
-        let logits = vec![0.1, 0.9, 0.3, 0.9];
-        let mut rng = 7u64;
-        assert_eq!(sample_token(&logits, 0.0, 1.0, &mut rng), 1);
-        assert_eq!(sample_token(&logits, 0.0, 1.0, &mut rng), 1);
-    }
-
-    #[test]
-    fn sampled_tokens_respect_top_p_support() {
-        let logits = vec![10.0, 0.0, 0.0, 0.0];
-        let mut rng = 99u64;
-        for _ in 0..100 {
-            assert_eq!(sample_token(&logits, 1.0, 0.5, &mut rng), 0);
-        }
     }
 }

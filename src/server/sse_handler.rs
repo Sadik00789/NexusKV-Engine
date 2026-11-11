@@ -1,10 +1,12 @@
 // src/server/sse_handler.rs
 use crate::config::EngineConfig;
-use crate::engine::{EngineActor, GenerateJob, Request, Scheduler, Snapshot, TokenMsg};
-use crate::memory::BlockSpaceManager;
+use crate::engine::{
+    EngineActor, GenerateJob, Request, Scheduler, Snapshot, TelemetrySink, TokenMsg,
+};
+use crate::memory::{BlockIo, BlockSpaceManager, FlightRecorder, MemEvent};
 use crate::model::{Executor, MockExecutor, MockTokenizer, Tokenizer};
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -18,9 +20,10 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 
 /// Shared application state. There are no scheduler or allocator locks: the
 /// actor thread is the only writer, and telemetry is published as a snapshot.
@@ -29,6 +32,7 @@ pub struct AppState {
     pub config: EngineConfig,
     pub request_tx: UnboundedSender<Request>,
     pub snapshot: Arc<Mutex<Snapshot>>,
+    pub recorder: Arc<Mutex<FlightRecorder>>,
     pub tokenizer: Arc<dyn Tokenizer>,
     pub next_seq: Arc<AtomicUsize>,
     pub model_id: String,
@@ -49,11 +53,31 @@ impl AppState {
         )
     }
 
+    pub fn mock_with_io(config: EngineConfig, io: Option<Box<dyn BlockIo>>) -> Self {
+        Self::with_executor_and_io(
+            config,
+            Box::new(MockExecutor::new()),
+            Arc::new(MockTokenizer),
+            "nexuskv-mock-v1",
+            io,
+        )
+    }
+
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
         tokenizer: Arc<dyn Tokenizer>,
         model_id: impl Into<String>,
+    ) -> Self {
+        Self::with_executor_and_io(config, executor, tokenizer, model_id, None)
+    }
+
+    pub fn with_executor_and_io(
+        config: EngineConfig,
+        executor: Box<dyn Executor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        model_id: impl Into<String>,
+        io: Option<Box<dyn BlockIo>>,
     ) -> Self {
         let model_id = model_id.into();
         let executor_name = executor.name().to_string();
@@ -62,6 +86,12 @@ impl AppState {
                 "MOCK EXECUTOR ACTIVE — token streams are synthetic; no model weights are loaded. \
                  This mode is labeled \"executor\": \"mock\" in /v1/models and /v1/metrics."
             );
+            if io.is_some() {
+                tracing::warn!(
+                    "MOCK TIERING ACTIVE — block contents are synthetic bytes; the paging, host \
+                     LRU, and NVMe spill machinery are real."
+                );
+            }
         }
 
         let snapshot = Arc::new(Mutex::new(Snapshot::initial(
@@ -70,20 +100,50 @@ impl AppState {
             config.total_physical_blocks,
             config.block_size,
         )));
+        let recorder = Arc::new(Mutex::new(FlightRecorder::default()));
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MemEvent>(8192);
+        let recorder_thread = Arc::clone(&recorder);
+        std::thread::Builder::new()
+            .name("nexuskv-flight-recorder".to_string())
+            .spawn(move || {
+                while let Ok(event) = event_rx.recv() {
+                    if let Ok(mut recorder) = recorder_thread.lock() {
+                        recorder.record_event(event);
+                    }
+                }
+            })
+            .expect("failed to start the flight recorder thread");
+
         let (request_tx, request_rx) = unbounded_channel();
         let scheduler = Scheduler::new(config.max_num_seqs, config.max_num_batched_tokens);
-        let block_manager = BlockSpaceManager::new(
-            config.total_physical_blocks,
-            config.block_size,
-            config.max_blocks_per_seq,
-        );
+        let mut block_manager = match io {
+            Some(io) => BlockSpaceManager::with_io(
+                config.total_physical_blocks,
+                config.block_size,
+                config.max_blocks_per_seq,
+                io,
+            ),
+            None => BlockSpaceManager::new(
+                config.total_physical_blocks,
+                config.block_size,
+                config.max_blocks_per_seq,
+            ),
+        };
+        // Non-blocking telemetry: dropping an event under extreme pressure is
+        // preferable to stalling the allocator; keyframes keep replay bounded.
+        block_manager.set_event_sink(Box::new(move |event| {
+            let _ = event_tx.try_send(event);
+        }));
         let actor = EngineActor::new(
             request_rx,
             scheduler,
             block_manager,
             executor,
             Arc::clone(&tokenizer),
-            Arc::clone(&snapshot),
+            TelemetrySink {
+                snapshot: Arc::clone(&snapshot),
+                recorder: Arc::clone(&recorder),
+            },
             model_id.clone(),
         );
         std::thread::Builder::new()
@@ -95,6 +155,7 @@ impl AppState {
             config,
             request_tx,
             snapshot,
+            recorder,
             tokenizer,
             next_seq: Arc::new(AtomicUsize::new(1)),
             model_id,
@@ -165,6 +226,7 @@ pub struct TelemetryPayload {
     pub adaptive_k: usize,
     pub executor: String,
     pub active_block_ids: Vec<usize>,
+    pub event_tick: u64,
     pub is_finished: bool,
     pub finish_reason: Option<String>,
 }
@@ -367,6 +429,7 @@ fn telemetry_payload(
         adaptive_k: snapshot.adaptive_k,
         executor: snapshot.executor,
         active_block_ids,
+        event_tick: snapshot.event_tick,
         is_finished,
         finish_reason,
     }
@@ -386,7 +449,7 @@ pub async fn stream_generation(
     }
 
     let seq_id = state.next_sequence_id();
-    let (tx, mut rx) = unbounded_channel::<TokenMsg>();
+    let (tx, rx) = unbounded_channel::<TokenMsg>();
     let job = GenerateJob {
         seq: seq_id,
         prompt: prompt_tokens,
@@ -404,9 +467,19 @@ pub async fn stream_generation(
             .into_response();
     }
 
+    sse_generation_response(state, seq_id, rx)
+}
+
+/// Relay one sequence's `TokenMsg` channel into the engine telemetry SSE
+/// schema. Shared by normal generation and session checkout.
+fn sse_generation_response(
+    state: AppState,
+    seq_id: usize,
+    mut rx: UnboundedReceiver<TokenMsg>,
+) -> Response {
     let completed = Arc::new(AtomicBool::new(false));
     let guard = make_guard(&state, seq_id, Arc::clone(&completed));
-    let stream_state = state.clone();
+    let stream_state = state;
 
     let stream = async_stream::stream! {
         let _guard = guard;
@@ -473,6 +546,218 @@ pub async fn stream_generation(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitRequest {
+    pub session: String,
+    pub parent: Option<u64>,
+    #[serde(default)]
+    pub label: String,
+    pub seq: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForgetRequest {
+    pub node: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckoutRequest {
+    pub node: u64,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub spec: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimeTravelQuery {
+    pub tick: Option<u64>,
+}
+
+async fn oneshot_result<T>(
+    receiver: oneshot::Receiver<Result<T, String>>,
+) -> Result<T, Box<Response>>
+where
+    T: Send + 'static,
+{
+    match tokio::time::timeout(Duration::from_secs(30), receiver).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(error))) => Err(Box::new(
+            (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({"error": error})),
+            )
+                .into_response(),
+        )),
+        Ok(Err(_)) => Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": "engine dropped the request"})),
+            )
+                .into_response(),
+        )),
+        Err(_) => Err(Box::new(
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                axum::Json(serde_json::json!({"error": "engine request timed out"})),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+pub async fn commit_session(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<CommitRequest>,
+) -> Response {
+    let (reply, receiver) = oneshot::channel();
+    let label = if payload.label.is_empty() {
+        format!("checkpoint-{}", payload.seq)
+    } else {
+        payload.label
+    };
+    if state
+        .request_tx
+        .send(Request::Commit {
+            session: payload.session,
+            parent: payload.parent,
+            label,
+            seq: payload.seq,
+            reply,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
+    }
+    match oneshot_result(receiver).await {
+        Ok(node) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"node": node})),
+        )
+            .into_response(),
+        Err(response) => *response,
+    }
+}
+
+pub async fn checkout_session(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<CheckoutRequest>,
+) -> Response {
+    let seq_id = state.next_sequence_id();
+    let (tx, rx) = unbounded_channel::<TokenMsg>();
+    let job = GenerateJob {
+        seq: seq_id,
+        prompt: Vec::new(),
+        max_tokens: payload.max_tokens.max(1),
+        temperature: payload.temperature.unwrap_or(0.7).max(0.0),
+        top_p: payload.top_p.unwrap_or(1.0),
+        spec: payload.spec,
+        tx,
+    };
+    if state
+        .request_tx
+        .send(Request::Checkout {
+            node: payload.node,
+            job,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
+    }
+    sse_generation_response(state, seq_id, rx)
+}
+
+pub async fn forget_session(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<ForgetRequest>,
+) -> Response {
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .request_tx
+        .send(Request::Forget {
+            node: payload.node,
+            reply,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
+    }
+    match oneshot_result(receiver).await {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"forgotten": payload.node})),
+        )
+            .into_response(),
+        Err(response) => *response,
+    }
+}
+
+pub async fn session_tree(State(state): State<AppState>, Path(session): Path<String>) -> Response {
+    let (reply, receiver) = oneshot::channel();
+    if state
+        .request_tx
+        .send(Request::SessionTree {
+            session: session.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "engine actor is not running"})),
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(30), receiver).await {
+        Ok(Ok(tree)) => axum::Json(tree).into_response(),
+        Ok(Err(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": "engine dropped the request"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            axum::Json(serde_json::json!({"error": "engine request timed out"})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn timetravel(
+    State(state): State<AppState>,
+    Query(query): Query<TimeTravelQuery>,
+) -> Response {
+    let recorder = state
+        .recorder
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tick = query.tick.unwrap_or_else(|| recorder.latest_tick());
+    match recorder.replay_to(tick) {
+        Some(replay) => axum::Json(replay).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!("no keyframe at or before tick {tick}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn chat_completions(

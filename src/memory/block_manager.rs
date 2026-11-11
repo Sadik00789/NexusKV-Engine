@@ -46,9 +46,20 @@ pub enum BlockState {
 /// Persistent tiering hook. `hash` is the trie content hash (FNV-1a chain),
 /// which makes the store content-addressed without the block manager needing
 /// to understand KV tensor layouts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockIoStats {
+    pub swapped_out: u64,
+    pub swapped_in: u64,
+    pub disk_spills: u64,
+    pub disk_loads: u64,
+}
+
 pub trait BlockIo: Send {
     fn save(&mut self, hash: u64, block: BlockId) -> Result<(), String>;
     fn load(&mut self, hash: u64, block: BlockId) -> Result<(), String>;
+    fn stats(&self) -> BlockIoStats {
+        BlockIoStats::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,6 +82,11 @@ pub struct MemEvent {
     pub kind: MemEventKind,
     pub seq: Option<SeqId>,
     pub blocks: Vec<BlockId>,
+    /// Set on `Free` events when the released block became trie-cached instead
+    /// of returning to the free stack. The replay reducer uses this to
+    /// distinguish `Cached` from `Free`.
+    #[serde(default)]
+    pub cached: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,14 +321,22 @@ impl BlockSpaceManager {
         self.sink = Some(sink);
     }
 
+    pub fn event_tick(&self) -> u64 {
+        self.event_tick
+    }
+
     fn emit(&mut self, kind: MemEventKind, seq: Option<SeqId>, blocks: Vec<BlockId>) {
         self.event_tick = self.event_tick.wrapping_add(1);
+        let cached = kind == MemEventKind::Free
+            && blocks.len() == 1
+            && self.states[blocks[0]] == BlockState::Cached;
         if let Some(sink) = self.sink.as_mut() {
             sink(MemEvent {
                 tick: self.event_tick,
                 kind,
                 seq,
                 blocks,
+                cached,
             });
         }
     }
@@ -782,7 +806,14 @@ impl BlockSpaceManager {
                 physical_block_ids: child_blocks.clone(),
             },
         );
-        self.emit(MemEventKind::Fork, Some(child), child_blocks);
+        // Only the shared prefix increments references. The private CoW tail
+        // was freshly allocated (an `Alloc` event) and must not be counted twice
+        // by the replay reducer.
+        self.emit(
+            MemEventKind::Fork,
+            Some(child),
+            child_blocks[..shared_prefix_len].to_vec(),
+        );
         Ok(())
     }
 
@@ -1111,6 +1142,10 @@ impl BlockSpaceManager {
 
     pub fn stats(&self) -> MemStats {
         self.stats
+    }
+
+    pub fn io_stats(&self) -> BlockIoStats {
+        self.io.as_ref().map(|io| io.stats()).unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
