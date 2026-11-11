@@ -64,32 +64,40 @@ pub fn nvcc_flags(target_os: &str) -> Vec<&'static str> {
         "-gencode=arch=compute_86,code=compute_86",
     ];
     if target_os == "windows" {
-        // CUDA 12.6 predates the newest MSVC minor releases. The flag only
-        // relaxes nvcc's version gate; the produced binaries still target the
-        // installed cl.exe. The build script logs when it is used.
+        // CUDA toolkits frequently ship before the newest MSVC minor releases.
+        // The flag only relaxes nvcc's version gate; the produced binaries still
+        // target the installed cl.exe. The build script logs when it is used.
         flags.push("-allow-unsupported-compiler");
     }
     flags
 }
 
 /// Conventional toolkit locations when neither `CUDA_HOME` nor `CUDA_PATH` is
-/// set. The per-user tree is the documented non-admin layout used on this
-/// machine; the Program Files entry is the normal installer layout.
+/// set. Newest first so a 13.4 install wins over an older 12.6 one. The per-user
+/// tree is the documented non-admin layout; the Program Files entries are the
+/// normal installer layout.
+///
+/// The ceiling is cudarc 0.19.10 (candle 0.9.x): its build script panics on any
+/// toolkit newer than 13.4, so 13.4 is the newest usable major.minor.
 pub fn default_cuda_candidates(target_os: &str, user_profile: Option<&Path>) -> Vec<PathBuf> {
     if target_os == "windows" {
         let mut candidates = Vec::new();
         if let Some(profile) = user_profile {
-            candidates.push(profile.join("cuda-12.6"));
+            for version in ["13.4", "13.2", "12.6", "12.4"] {
+                candidates.push(profile.join(format!("cuda-{version}")));
+            }
         }
-        candidates.push(PathBuf::from(
-            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6",
-        ));
+        for version in ["v13.4", "v13.2", "v12.6", "v12.4"] {
+            candidates.push(PathBuf::from(format!(
+                r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\{version}"
+            )));
+        }
         candidates
     } else {
         vec![
-            PathBuf::from("/usr/local/cuda-12.6"),
+            PathBuf::from("/usr/local/cuda-13.4"),
             PathBuf::from("/usr/local/cuda"),
-            PathBuf::from("/usr/local/cuda-13.1"),
+            PathBuf::from("/usr/local/cuda-12.6"),
         ]
     }
 }
@@ -160,11 +168,23 @@ mod tests {
     fn default_candidates_cover_user_and_installer_layouts() {
         let profile = Path::new(r"C:\Users\test");
         let windows = default_cuda_candidates("windows", Some(profile));
+        assert!(windows.contains(&profile.join("cuda-13.4")));
         assert!(windows.contains(&profile.join("cuda-12.6")));
         assert!(
             windows
                 .iter()
-                .any(|path| path.to_string_lossy().contains("v12.6"))
+                .any(|path| path.to_string_lossy().contains("v13.4"))
+        );
+        // Newest candidate first: a 13.4 install must win over 12.6.
+        assert!(
+            windows
+                .iter()
+                .position(|path| path.to_string_lossy().contains("13.4"))
+                .unwrap()
+                < windows
+                    .iter()
+                    .position(|path| path.to_string_lossy().contains("12.6"))
+                    .unwrap()
         );
         let linux = default_cuda_candidates("linux", None);
         assert!(linux.contains(&PathBuf::from("/usr/local/cuda")));

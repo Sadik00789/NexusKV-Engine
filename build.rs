@@ -26,11 +26,11 @@ fn main() {
 
     let cuda_home = resolve_cuda_home(&target_os).unwrap_or_else(|| {
         panic!(
-            "the `cuda` feature requires the CUDA toolkit, but neither CUDA_HOME/CUDA_PATH \
-             nor a conventional toolkit directory was found.\n\
-             Fix: run `powershell -ExecutionPolicy Bypass -File scripts/check_env.ps1` \
-             and follow its instructions (native Windows: install CUDA Toolkit 12.6, then \
-             set CUDA_PATH to its root)."
+            "the `cuda` feature requires the CUDA toolkit (12.6 through 13.4), but neither \
+             CUDA_HOME/CUDA_PATH nor a conventional toolkit directory was found.\n\
+             Fix: on native Windows run \
+             `powershell -ExecutionPolicy Bypass -File scripts/install_cuda_user.ps1` \
+             (no Administrator rights needed), or set CUDA_PATH to an existing toolkit root."
         )
     });
     println!(
@@ -80,7 +80,7 @@ fn main() {
     }
     if build_support::is_msvc_target(&target) {
         println!(
-            "cargo:warning=CUDA 12.6 predates the installed MSVC minor; \
+            "cargo:warning=CUDA often predates the installed MSVC minor; \
              -allow-unsupported-compiler is enabled (host compiler is still cl.exe)"
         );
     }

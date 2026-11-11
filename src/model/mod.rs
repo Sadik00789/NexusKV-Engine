@@ -11,6 +11,18 @@ pub enum ModelError {
     Invalid(String),
 }
 
+/// One sequence inside a batched decode step.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeInput<'a> {
+    pub seq: SeqId,
+    /// Input tokens for this sequence, at absolute positions
+    /// `start .. start + tokens.len()`. Decode passes one token plus any
+    /// speculative drafts.
+    pub tokens: &'a [u32],
+    /// Absolute position of `tokens[0]`.
+    pub start: usize,
+}
+
 /// A model executor writes KV for `tokens` at absolute positions
 /// `[start, start + tokens.len())` into the paged pool and returns logits.
 ///
@@ -26,6 +38,33 @@ pub trait Executor: Send {
         start: usize,
         all_logits: bool,
     ) -> Result<Vec<Vec<f32>>, ModelError>;
+
+    /// Batched decode: one forward pass over the model for several sequences.
+    ///
+    /// Returns one logits row list per input, in input order, aligned with each
+    /// input's `tokens` (one vocabulary-sized vector per token), so speculative
+    /// verification can consume it directly.
+    ///
+    /// The default implementation keeps one forward per sequence, so executors
+    /// that cannot batch (the mock) stay correct. Real executors override it
+    /// with a fused pass and report `is_batched_decode() == true`.
+    fn forward_decode_batch(
+        &mut self,
+        block_manager: &mut BlockSpaceManager,
+        inputs: &[DecodeInput<'_>],
+    ) -> Result<Vec<Vec<Vec<f32>>>, ModelError> {
+        let mut rows = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            rows.push(self.forward(block_manager, input.seq, input.tokens, input.start, true)?);
+        }
+        Ok(rows)
+    }
+
+    /// Whether `forward_decode_batch` performs one fused forward pass. Telemetry
+    /// reports this so a per-sequence loop is never presented as batching.
+    fn is_batched_decode(&self) -> bool {
+        false
+    }
 
     /// Called once when a sequence is admitted. Executors that derive state
     /// from the prompt (the mock's deterministic offset) use the full prompt

@@ -13,6 +13,7 @@
 
 use nexuskv::config::EngineConfig;
 use nexuskv::engine::{GenerateJob, Request, TokenMsg};
+#[cfg(feature = "cuda")]
 use nexuskv::model::Executor;
 use nexuskv::model::qwen::load_model_and_tokenizer;
 use nexuskv::server::AppState;
@@ -154,6 +155,155 @@ fn argmax(values: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// Batched decode with real weights must match per-sequence decode: identical
+/// greedy tokens, and logits within the same relative L2 tolerance the kernel
+/// parity test uses.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an NVIDIA GPU, CUDA build, and NEXUSKV_TEST_MODEL=<Qwen3 dir>"]
+fn real_weights_batched_decode_matches_sequential_decode() {
+    use nexuskv::memory::BlockSpaceManager;
+    use nexuskv::model::{DecodeInput, Executor};
+
+    let directory = std::env::var("NEXUSKV_TEST_MODEL")
+        .expect("set NEXUSKV_TEST_MODEL to a Qwen3/Qwen2 model directory");
+    let config = real_config();
+    let (mut batched, tokenizer) =
+        load_model_and_tokenizer(&PathBuf::from(&directory), &config).expect("load batched model");
+    let (mut sequential, _) =
+        load_model_and_tokenizer(&PathBuf::from(&directory), &config).expect("load sequential");
+
+    // Three distinct prompts; block-align so every sequence owns full blocks.
+    let texts = [
+        "The capital of France is Paris. ".repeat(3),
+        "Continuous batching keeps the GPU busy. ".repeat(3),
+        "Paged attention stores KV in fixed blocks. ".repeat(3),
+    ];
+    let mut prompts: Vec<Vec<u32>> = texts
+        .iter()
+        .map(|text| {
+            let mut tokens = tokenizer.encode(text);
+            tokens.truncate((tokens.len() / config.block_size) * config.block_size);
+            tokens
+        })
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| prompt.len() >= config.block_size),
+        "prompts must be at least one block long"
+    );
+
+    let mut batched_manager =
+        BlockSpaceManager::new(config.total_physical_blocks, config.block_size, 24);
+    let mut sequential_manager =
+        BlockSpaceManager::new(config.total_physical_blocks, config.block_size, 24);
+    for (index, prompt) in prompts.iter().enumerate() {
+        let seq = index + 1;
+        batched_manager
+            .match_or_allocate_prefix(seq, prompt)
+            .expect("batched prompt");
+        sequential_manager
+            .match_or_allocate_prefix(seq, prompt)
+            .expect("sequential prompt");
+        // Prefill both sides with gather attention.
+        batched
+            .forward(&mut batched_manager, seq, prompt, 0, false)
+            .expect("batched prefill");
+        sequential
+            .forward(&mut sequential_manager, seq, prompt, 0, false)
+            .expect("sequential prefill");
+    }
+
+    // First decoded token per sequence (greedy argmax of the prefill logits).
+    let mut tokens: Vec<u32> = prompts.iter().map(|_| 0u32).collect();
+    for index in 0..prompts.len() {
+        let seq = index + 1;
+        let logits = batched
+            .forward(
+                &mut batched_manager,
+                seq,
+                &prompts[index][prompts[index].len() - 1..],
+                prompts[index].len() - 1,
+                false,
+            )
+            .expect("prefill tail logits");
+        tokens[index] = argmax(&logits[0]);
+    }
+    // Align the managers: the tail forward above did not append a token, so
+    // append one slot per sequence for the decode step.
+    for index in 0..prompts.len() {
+        let seq = index + 1;
+        batched_manager
+            .append_tokens(seq, 1)
+            .expect("batched append");
+        sequential_manager
+            .append_tokens(seq, 1)
+            .expect("sequential append");
+    }
+
+    for step in 0..4 {
+        let starts: Vec<usize> = prompts.iter().map(Vec::len).collect();
+        let inputs: Vec<DecodeInput<'_>> = (0..prompts.len())
+            .map(|index| DecodeInput {
+                seq: index + 1,
+                tokens: std::slice::from_ref(&tokens[index]),
+                start: starts[index] + step,
+            })
+            .collect();
+        let batched_logits = batched
+            .forward_decode_batch(&mut batched_manager, &inputs)
+            .expect("batched decode");
+        assert_eq!(batched_logits.len(), prompts.len());
+
+        for index in 0..prompts.len() {
+            let seq = index + 1;
+            let sequential_logits = sequential
+                .forward(
+                    &mut sequential_manager,
+                    seq,
+                    std::slice::from_ref(&tokens[index]),
+                    starts[index] + step,
+                    false,
+                )
+                .expect("sequential decode");
+            let reference = &sequential_logits[0];
+            let candidate = &batched_logits[index][0];
+            let mut squared_difference = 0f64;
+            let mut squared_reference = 0f64;
+            for (a, b) in candidate.iter().zip(reference.iter()) {
+                let difference = f64::from(a - b);
+                squared_difference += difference * difference;
+                squared_reference += f64::from(*b) * f64::from(*b);
+            }
+            let relative_l2 = (squared_difference / squared_reference.max(1e-12)).sqrt();
+            assert!(
+                relative_l2 < 2e-2,
+                "step {step} sequence {seq}: relative L2 {relative_l2} exceeds 2e-2"
+            );
+            assert_eq!(
+                argmax(candidate),
+                argmax(reference),
+                "step {step} sequence {seq}: greedy tokens diverged"
+            );
+            tokens[index] = argmax(candidate);
+        }
+        // Model the actor's page-table growth for the next step.
+        for index in 0..prompts.len() {
+            let seq = index + 1;
+            batched_manager
+                .append_tokens(seq, 1)
+                .expect("batched step append");
+            sequential_manager
+                .append_tokens(seq, 1)
+                .expect("sequential step append");
+        }
+    }
+    batched_manager.assert_invariants();
+    sequential_manager.assert_invariants();
+    prompts.clear();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

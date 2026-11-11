@@ -327,3 +327,76 @@ fn mock_tokenizer_is_byte_based() {
     assert_eq!(tokens, vec![65, 66]);
     assert_eq!(tokenizer.decode(&tokens), "AB");
 }
+
+/// Concurrent sequences must be served by fused decode forwards, not one
+/// forward per sequence. The mock executor cannot fuse, so this asserts the
+/// telemetry shape (counters exist and are consistent) and leaves the fused
+/// claim to `model::qwen` tests that run real weights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_telemetry_reports_batch_counters() {
+    let mut config = test_config();
+    config.total_physical_blocks = 128;
+    config.max_num_seqs = 4;
+    let state = AppState::mock(config);
+
+    let prompt: Vec<u32> = b"batched decode telemetry probe"
+        .iter()
+        .map(|&byte| u32::from(byte))
+        .collect();
+    let mut receivers = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let seq = state.next_sequence_id();
+        let (tx, rx) = unbounded_channel();
+        state
+            .request_tx
+            .send(Request::Generate(GenerateJob {
+                seq,
+                prompt: prompt.clone(),
+                max_tokens: 12,
+                temperature: 0.0,
+                top_p: 1.0,
+                spec: false,
+                tx,
+            }))
+            .unwrap();
+        ids.push(seq);
+        receivers.push(rx);
+    }
+
+    for mut rx in receivers {
+        while let Some(TokenMsg::Token { .. }) =
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("timed out waiting for tokens")
+        {}
+    }
+
+    for _ in 0..200 {
+        if state.snapshot().running_sequences == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let snapshot = state.snapshot();
+    assert!(
+        snapshot.decode_batches > 0,
+        "decode forwards must be counted"
+    );
+    assert!(
+        snapshot.decode_batch_sequences >= snapshot.decode_batches,
+        "batched sequence count cannot be below the batch count"
+    );
+    assert!(
+        snapshot.max_decode_batch >= 1,
+        "largest batch must be recorded"
+    );
+    // The mock executor does not fuse; it must not claim to.
+    assert!(
+        !snapshot.batched_decode,
+        "the mock executor must not claim fused batching"
+    );
+    for seq in ids {
+        state.request_tx.send(Request::Abort { seq }).unwrap();
+    }
+}

@@ -71,6 +71,10 @@ export default function Home() {
         swapBytesOut: 0,
         swapBytesIn: 0,
         attentionBackend: "unknown",
+        batchedDecode: false,
+        decodeBatches: 0,
+        decodeBatchSequences: 0,
+        maxDecodeBatch: 0,
     });
 
     // Time-travel + sessions
@@ -113,6 +117,10 @@ export default function Home() {
                         swapBytesOut: Number(data.swap_bytes_out ?? 0),
                         swapBytesIn: Number(data.swap_bytes_in ?? 0),
                         attentionBackend: String(data.attention_backend ?? "unknown"),
+                        batchedDecode: Boolean(data.batched_decode ?? false),
+                        decodeBatches: Number(data.decode_batches ?? 0),
+                        decodeBatchSequences: Number(data.decode_batch_sequences ?? 0),
+                        maxDecodeBatch: Number(data.max_decode_batch ?? 0),
                     });
                     if (data.block_inspect_info) {
                         setBlocksMetadata(data.block_inspect_info);
@@ -211,6 +219,18 @@ export default function Home() {
                             adaptiveK: Number(data.adaptive_k ?? previous.adaptiveK),
                             attentionBackend: String(
                                 data.attention_backend ?? previous.attentionBackend
+                            ),
+                            batchedDecode: Boolean(
+                                data.batched_decode ?? previous.batchedDecode
+                            ),
+                            decodeBatches: Number(
+                                data.decode_batches ?? previous.decodeBatches
+                            ),
+                            decodeBatchSequences: Number(
+                                data.decode_batch_sequences ?? previous.decodeBatchSequences
+                            ),
+                            maxDecodeBatch: Number(
+                                data.max_decode_batch ?? previous.maxDecodeBatch
                             ),
                         }));
                         if (Array.isArray(data.active_block_ids)) {

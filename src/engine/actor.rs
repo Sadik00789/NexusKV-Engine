@@ -8,7 +8,7 @@ use super::speculative::{
 use crate::memory::{
     BlockId, BlockInspectInfo, BlockSpaceManager, FlightRecorder, MemoryError, SeqId,
 };
-use crate::model::{Executor, Tokenizer};
+use crate::model::{DecodeInput, Executor, Tokenizer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -98,6 +98,14 @@ pub struct Snapshot {
     pub speculative_proposed: u64,
     pub speculative_accepted: u64,
     pub adaptive_k: usize,
+    /// True when the executor fuses decode steps into one model forward.
+    pub batched_decode: bool,
+    /// Fused decode forwards executed.
+    pub decode_batches: u64,
+    /// Sequences covered by those fused forwards.
+    pub decode_batch_sequences: u64,
+    /// Largest fused decode forward so far.
+    pub max_decode_batch: usize,
     pub tokens_per_sec: f64,
     pub ttft_p50_ms: f64,
     pub evictions: u64,
@@ -150,6 +158,10 @@ impl Snapshot {
             speculative_proposed: 0,
             speculative_accepted: 0,
             adaptive_k: 0,
+            batched_decode: false,
+            decode_batches: 0,
+            decode_batch_sequences: 0,
+            max_decode_batch: 0,
             tokens_per_sec: 0.0,
             ttft_p50_ms: 0.0,
             evictions: 0,
@@ -236,6 +248,9 @@ pub struct EngineActor {
     prefill_logits: HashMap<u64, Vec<f32>>,
     prefill_logits_order: VecDeque<u64>,
     prefill_tokens: u64,
+    decode_batches: u64,
+    decode_batch_sequences: u64,
+    max_decode_batch: usize,
 }
 
 const PREFILL_LOGIT_CACHE_ENTRIES: usize = 8;
@@ -277,6 +292,9 @@ impl EngineActor {
             prefill_logits: HashMap::new(),
             prefill_logits_order: VecDeque::new(),
             prefill_tokens: 0,
+            decode_batches: 0,
+            decode_batch_sequences: 0,
+            max_decode_batch: 0,
         }
     }
 
@@ -465,9 +483,7 @@ impl EngineActor {
         for seq in &batch.first_token {
             produced += self.emit_first_token(*seq);
         }
-        for seq in &batch.decode {
-            produced += self.run_decode(*seq);
-        }
+        produced += self.run_decode_batch(&batch.decode);
         self.apply_pending_copies();
         produced
     }
@@ -626,81 +642,198 @@ impl EngineActor {
         1
     }
 
-    fn run_decode(&mut self, seq_id: SeqId) -> usize {
-        let (last_token, start, temperature, top_p, spec, prompt_len, out_len) = {
-            let Some(seq) = self.scheduler.seq(seq_id) else {
-                return 0;
-            };
-            if !seq.ready_for_decode() {
-                return 0;
-            }
-            let Some(&last) = seq.out.last() else {
-                return 0;
-            };
-            (
-                last,
-                seq.computed,
-                seq.temperature,
-                seq.top_p,
-                seq.spec,
-                seq.prompt.len(),
-                seq.out.len(),
-            )
-        };
-
-        let selected_k = if spec { self.bandit.select() } else { 0 };
-        let mut drafts = if selected_k > 0 {
-            self.drafters
-                .get(&seq_id)
-                .map(|drafter| drafter.propose(selected_k))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Drafts must fit the per-sequence page-table capacity. The pool itself
-        // may still reject the append; that falls back to a plain decode below.
-        let capacity = self.block_manager.max_blocks_per_seq * self.block_manager.block_size;
-        let available = capacity.saturating_sub(prompt_len + out_len);
-        if available <= 1 {
-            drafts.clear();
-        } else {
-            drafts.truncate(available - 1);
+    /// Decode every scheduled sequence in one prepare → forward → verify pass.
+    ///
+    /// All inputs are appended and their page tables finalized first, then a
+    /// single `forward_decode_batch` call runs the model over the whole batch.
+    /// Verification, emission, and speculative rollback stay per sequence.
+    fn run_decode_batch(&mut self, seq_ids: &[SeqId]) -> usize {
+        if seq_ids.is_empty() {
+            return 0;
         }
 
-        let mut input = Vec::with_capacity(drafts.len() + 1);
-        input.push(last_token);
-        input.extend_from_slice(&drafts);
-        loop {
-            match self.block_manager.append_tokens(seq_id, input.len()) {
-                Ok(()) => break,
-                Err(MemoryError::OutOfMemory) | Err(MemoryError::CapacityExceeded)
-                    if input.len() > 1 =>
-                {
-                    input.truncate(1);
+        struct Prepared {
+            seq_id: SeqId,
+            temperature: f32,
+            top_p: f32,
+            spec: bool,
+            selected_k: usize,
+            prompt_len: usize,
+            out_len: usize,
+            start: usize,
+            drafts: Vec<u32>,
+            input: Vec<u32>,
+        }
+
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(seq_ids.len());
+        for &seq_id in seq_ids {
+            let (last_token, start, temperature, top_p, spec, prompt_len, out_len) = {
+                let Some(seq) = self.scheduler.seq(seq_id) else {
+                    continue;
+                };
+                if !seq.ready_for_decode() {
+                    continue;
                 }
-                Err(err) => {
-                    self.fail_seq(seq_id, format!("KV allocation failed: {err}"));
-                    return 0;
+                let Some(&last) = seq.out.last() else {
+                    continue;
+                };
+                (
+                    last,
+                    seq.computed,
+                    seq.temperature,
+                    seq.top_p,
+                    seq.spec,
+                    seq.prompt.len(),
+                    seq.out.len(),
+                )
+            };
+
+            let selected_k = if spec { self.bandit.select() } else { 0 };
+            let mut drafts = if selected_k > 0 {
+                self.drafters
+                    .get(&seq_id)
+                    .map(|drafter| drafter.propose(selected_k))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            // Drafts must fit the per-sequence page-table capacity. The pool
+            // itself may still reject the append; that falls back to a plain
+            // decode below.
+            let capacity = self.block_manager.max_blocks_per_seq * self.block_manager.block_size;
+            let available = capacity.saturating_sub(prompt_len + out_len);
+            if available <= 1 {
+                drafts.clear();
+            } else {
+                drafts.truncate(available - 1);
+            }
+
+            let mut input = Vec::with_capacity(drafts.len() + 1);
+            input.push(last_token);
+            input.extend_from_slice(&drafts);
+            loop {
+                match self.block_manager.append_tokens(seq_id, input.len()) {
+                    Ok(()) => break,
+                    Err(MemoryError::OutOfMemory) | Err(MemoryError::CapacityExceeded)
+                        if input.len() > 1 =>
+                    {
+                        input.truncate(1);
+                    }
+                    Err(err) => {
+                        self.fail_seq(seq_id, format!("KV allocation failed: {err}"));
+                        break;
+                    }
                 }
             }
+            // A capacity fallback may have dropped the drafts; keep the two in
+            // sync before the forward consumes `input`.
+            let input_len = input.len();
+            if self.scheduler.seq(seq_id).is_some() {
+                drafts.truncate(input_len.saturating_sub(1));
+                prepared.push(Prepared {
+                    seq_id,
+                    temperature,
+                    top_p,
+                    spec,
+                    selected_k,
+                    prompt_len,
+                    out_len,
+                    start,
+                    drafts,
+                    input,
+                });
+            }
         }
-        let drafts = &input[1..];
 
-        let started = Instant::now();
-        let logits =
-            match self
-                .executor
-                .forward(&mut self.block_manager, seq_id, &input, start, true)
-            {
-                Ok(logits) => logits,
-                Err(err) => {
-                    self.fail_seq(seq_id, format!("decode forward failed: {err}"));
-                    return 0;
-                }
-            };
+        if prepared.is_empty() {
+            return 0;
+        }
+
+        // Copy-on-write tails must be materialized before attention reads them;
+        // `append_tokens` records the (src, dst) pairs.
         self.apply_pending_copies();
 
+        let started = Instant::now();
+        let batch_logits = {
+            let inputs: Vec<DecodeInput<'_>> = prepared
+                .iter()
+                .map(|entry| DecodeInput {
+                    seq: entry.seq_id,
+                    tokens: &entry.input,
+                    start: entry.start,
+                })
+                .collect();
+            match self
+                .executor
+                .forward_decode_batch(&mut self.block_manager, &inputs)
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    // One failed batch must not corrupt unrelated sequences:
+                    // fail each member so clients see a real error, not silence.
+                    let message = format!("decode forward failed: {err}");
+                    for entry in &prepared {
+                        self.fail_seq(entry.seq_id, message.clone());
+                    }
+                    return 0;
+                }
+            }
+        };
+        self.apply_pending_copies();
+        let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0).max(1e-6);
+        self.decode_batches += 1;
+        self.decode_batch_sequences += prepared.len() as u64;
+        self.max_decode_batch = self.max_decode_batch.max(prepared.len());
+
+        if batch_logits.len() != prepared.len() {
+            let message = format!(
+                "executor returned {} logit rows for {} sequences",
+                batch_logits.len(),
+                prepared.len()
+            );
+            for entry in &prepared {
+                self.fail_seq(entry.seq_id, message.clone());
+            }
+            return 0;
+        }
+
+        let mut produced = 0usize;
+        for (entry, logits) in prepared.into_iter().zip(batch_logits) {
+            produced += self.finish_decode(
+                entry.seq_id,
+                &entry.drafts,
+                entry.temperature,
+                entry.top_p,
+                entry.spec,
+                entry.selected_k,
+                entry.prompt_len,
+                entry.out_len,
+                entry.start,
+                &logits,
+                elapsed_ms,
+            );
+        }
+        produced
+    }
+
+    /// Verification, emission, and rollback for one sequence after the batched
+    /// forward has produced its logits.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_decode(
+        &mut self,
+        seq_id: SeqId,
+        drafts: &[u32],
+        temperature: f32,
+        top_p: f32,
+        spec: bool,
+        selected_k: usize,
+        prompt_len: usize,
+        out_len: usize,
+        start: usize,
+        logits: &[Vec<f32>],
+        elapsed_ms: f64,
+    ) -> usize {
         let mut rng = SpecRng::new(
             self.scheduler
                 .seq(seq_id)
@@ -708,7 +841,7 @@ impl EngineActor {
                 .unwrap_or(1),
         );
         let verification = if temperature <= 1e-3 {
-            verify_greedy(&logits, drafts)
+            verify_greedy(logits, drafts)
         } else {
             let target: Vec<Vec<f64>> = logits
                 .iter()
@@ -723,7 +856,6 @@ impl EngineActor {
                 return 0;
             }
         };
-        let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0).max(1e-6);
 
         if spec {
             self.spec_stats
@@ -904,6 +1036,10 @@ impl EngineActor {
             speculative_proposed: self.spec_stats.proposed,
             speculative_accepted: self.spec_stats.accepted,
             adaptive_k: self.spec_stats.adaptive_k,
+            batched_decode: self.executor.is_batched_decode(),
+            decode_batches: self.decode_batches,
+            decode_batch_sequences: self.decode_batch_sequences,
+            max_decode_batch: self.max_decode_batch,
             tokens_per_sec: tps,
             ttft_p50_ms: ttft_p50,
             evictions: stats.evictions,

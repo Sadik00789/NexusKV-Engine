@@ -1,5 +1,5 @@
 // src/model/qwen.rs
-use super::{Executor, ModelError, Tokenizer};
+use super::{DecodeInput, Executor, ModelError, Tokenizer};
 use crate::config::EngineConfig;
 use crate::memory::tier::{GpuBridge, KvDType};
 use crate::memory::{BlockId, BlockSpaceManager, SeqId};
@@ -333,6 +333,60 @@ fn apply_rope(
         .to_dtype(dtype)
 }
 
+/// RoPE for packed decode rows. Each row of `x` (`[rows, heads, head_dim]`) is
+/// one sequence position, so the rotary table is gathered per row rather than
+/// sliced once.
+fn apply_rope_rows(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    positions: &[usize],
+) -> CandleResult<Tensor> {
+    let dtype = x.dtype();
+    let head_dim = x.dim(D::Minus1)?;
+    let half = head_dim / 2;
+    let count = positions.len();
+    let index = Tensor::from_vec(
+        positions.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
+        (count,),
+        x.device(),
+    )?;
+    let cos = cos.index_select(&index, 0)?.reshape((count, 1, head_dim))?;
+    let sin = sin.index_select(&index, 0)?.reshape((count, 1, head_dim))?;
+    let x = x.to_dtype(DType::F32)?;
+    let first = x.narrow(D::Minus1, 0, half)?;
+    let second = x.narrow(D::Minus1, half, half)?;
+    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
+    x.broadcast_mul(&cos)?
+        .add(&rotated.broadcast_mul(&sin)?)?
+        .to_dtype(dtype)
+}
+
+/// Write packed decode rows `[rows, kv_heads, head_dim]` into the paged KV pool
+/// at `slots`. Contiguous slot runs are written with one `slice_set`.
+fn write_kv_rows(
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    slots: &[usize],
+) -> CandleResult<()> {
+    let mut run_start = 0usize;
+    while run_start < slots.len() {
+        let mut run_end = run_start + 1;
+        while run_end < slots.len() && slots[run_end] == slots[run_end - 1] + 1 {
+            run_end += 1;
+        }
+        let len = run_end - run_start;
+        let k_run = k.narrow(0, run_start, len)?.contiguous()?;
+        let v_run = v.narrow(0, run_start, len)?.contiguous()?;
+        k_pool.slice_set(&k_run, 0, slots[run_start])?;
+        v_pool.slice_set(&v_run, 0, slots[run_start])?;
+        run_start = run_end;
+    }
+    Ok(())
+}
+
 fn causal_mask(start: usize, q_len: usize, k_len: usize, device: &Device) -> CandleResult<Tensor> {
     let mut mask = vec![0f32; q_len * k_len];
     for query in 0..q_len {
@@ -367,7 +421,12 @@ fn gather_attention(
     let value_dtype = v.dtype();
     let head_dim = q.dim(D::Minus1)?;
     let scale = 1.0 / (head_dim as f64).sqrt();
-    let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
+    // Transposed views are not contiguous; CUDA's matmul rejects them, so both
+    // sides are materialized before the product.
+    let scores = q
+        .contiguous()?
+        .matmul(&k.transpose(2, 3)?.contiguous()?)?
+        .affine(scale, 0.0)?;
     // Softmax and the probability × value accumulation both run in f32 for f16
     // pools; only the final attention output is narrowed back.
     let scores = scores.to_dtype(DType::F32)?;
@@ -377,17 +436,19 @@ fn gather_attention(
     // the custom kernel's accumulation and avoids a second f16 rounding before
     // o_proj. The result is narrowed back to the model dtype.
     probabilities
-        .matmul(&v.to_dtype(DType::F32)?)?
+        .contiguous()?
+        .matmul(&v.to_dtype(DType::F32)?.contiguous()?)?
         .to_dtype(value_dtype)
 }
 
 /// Per-forward state shared by every layer when the custom f16 decode kernel is
-/// active. The block table and sequence length live once on the device, not
+/// active. The block tables and sequence lengths live once on the device, not
 /// once per layer.
 #[cfg(feature = "cuda")]
 struct CudaDecodeContext {
     block_tables: Tensor,
     seq_lens: Tensor,
+    num_seqs: usize,
     max_blocks_per_seq: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -399,19 +460,21 @@ struct CudaDecodeContext {
 impl CudaDecodeContext {
     fn new(
         block_manager: &BlockSpaceManager,
-        seq: SeqId,
+        seqs: &[SeqId],
         device: &Device,
         config: &Qwen2Config,
     ) -> Result<Self, String> {
-        let (tables, lens) = block_manager.export_block_tables(&[seq]);
+        let (tables, lens) = block_manager.export_block_tables(seqs);
         let max_blocks_per_seq = block_manager.max_blocks_per_seq;
-        let block_tables = Tensor::from_vec(tables, (max_blocks_per_seq,), device)
-            .map_err(|error| format!("cannot upload block table: {error}"))?;
-        let seq_lens = Tensor::from_vec(lens, (1,), device)
+        let num_seqs = seqs.len();
+        let block_tables = Tensor::from_vec(tables, (num_seqs, max_blocks_per_seq), device)
+            .map_err(|error| format!("cannot upload block tables: {error}"))?;
+        let seq_lens = Tensor::from_vec(lens, (num_seqs,), device)
             .map_err(|error| format!("cannot upload seq lens: {error}"))?;
         Ok(Self {
             block_tables,
             seq_lens,
+            num_seqs,
             max_blocks_per_seq,
             num_heads: config.num_heads,
             num_kv_heads: config.num_kv_heads,
@@ -420,6 +483,10 @@ impl CudaDecodeContext {
         })
     }
 
+    /// One decode step for `num_seqs` sequences, one query token each.
+    ///
+    /// `q` is flat `[num_seqs, num_heads, head_dim]`; the kernel derives the
+    /// sequence from `blockIdx.x` and the head from `blockIdx.y`.
     fn attention(
         &self,
         q: &Tensor,
@@ -445,8 +512,12 @@ impl CudaDecodeContext {
         };
         let stream = cuda_device.cuda_stream();
         let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
-        let out = Tensor::zeros((1, self.num_heads, 1, self.head_dim), DType::F16, device)
-            .map_err(|error| format!("cannot allocate attention output: {error}"))?;
+        let out = Tensor::zeros(
+            (self.num_seqs * self.num_heads * self.head_dim,),
+            DType::F16,
+            device,
+        )
+        .map_err(|error| format!("cannot allocate attention output: {error}"))?;
 
         let (q_storage, q_layout) = q.storage_and_layout();
         let q_cuda = match &*q_storage {
@@ -535,7 +606,7 @@ impl CudaDecodeContext {
                 tables_pointer,
                 lens_pointer,
                 self.max_blocks_per_seq,
-                1,
+                self.num_seqs,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -767,7 +838,7 @@ impl Qwen2Model {
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
         #[cfg(feature = "cuda")]
         let cuda_context = if use_cuda_kernel && seq_len == 1 {
-            match CudaDecodeContext::new(block_manager, seq, device, &self.config) {
+            match CudaDecodeContext::new(block_manager, &[seq], device, &self.config) {
                 Ok(context) => Some(context),
                 Err(error) => {
                     warn_cuda_attention_fallback(&error);
@@ -829,15 +900,35 @@ impl Qwen2Model {
                     #[cfg(feature = "cuda")]
                     {
                         let custom = cuda_context.as_ref().and_then(|context| {
-                            match context.attention(
-                                &q,
-                                &pools.k[layer_index],
-                                &pools.v[layer_index],
-                                device,
-                            ) {
-                                Ok(attention) => Some(attention),
+                            // The kernel takes flat [seqs, heads, head_dim]; this
+                            // path is exactly one sequence with one query token.
+                            let flat = q
+                                .reshape((self.config.num_heads, self.config.head_dim))
+                                .and_then(|tensor| tensor.contiguous());
+                            match flat {
+                                Ok(q) => match context.attention(
+                                    &q,
+                                    &pools.k[layer_index],
+                                    &pools.v[layer_index],
+                                    device,
+                                ) {
+                                    // Rebuild the [1, heads, 1, head_dim] shape
+                                    // the shared prologue below expects.
+                                    Ok(attention) => attention
+                                        .reshape((
+                                            1,
+                                            self.config.num_heads,
+                                            1,
+                                            self.config.head_dim,
+                                        ))
+                                        .ok(),
+                                    Err(error) => {
+                                        warn_cuda_attention_fallback(&error);
+                                        None
+                                    }
+                                },
                                 Err(error) => {
-                                    warn_cuda_attention_fallback(&error);
+                                    warn_cuda_attention_fallback(&error.to_string());
                                     None
                                 }
                             }
@@ -928,6 +1019,265 @@ impl Qwen2Model {
             .chunks(vocabulary)
             .map(|chunk| chunk.to_vec())
             .collect())
+    }
+
+    /// Fused batched decode: every weight matmul in the model runs once for all
+    /// input sequences instead of once per sequence.
+    ///
+    /// Rows from all sequences are packed into `[rows, hidden]`, so the
+    /// projections, QK-norm, RoPE, MLP, and lm_head are single batched GEMMs.
+    /// Paged attention stays per sequence because each sequence has its own
+    /// page table and length; with the custom f16 kernel and one token per
+    /// sequence it collapses into one multi-sequence kernel launch.
+    fn forward_decode_batch(
+        &mut self,
+        block_manager: &mut BlockSpaceManager,
+        inputs: &[DecodeInput<'_>],
+    ) -> Result<Vec<Vec<Vec<f32>>>, ModelError> {
+        if inputs.is_empty() {
+            return Err(ModelError::Invalid(
+                "batched decode requires at least one sequence".to_string(),
+            ));
+        }
+        for input in inputs {
+            if input.tokens.is_empty() {
+                return Err(ModelError::Invalid(format!(
+                    "sequence {} has no input tokens",
+                    input.seq
+                )));
+            }
+            for &token in input.tokens {
+                if token as usize >= self.config.vocab_size {
+                    return Err(ModelError::Invalid(format!(
+                        "token id {token} exceeds model vocab {}",
+                        self.config.vocab_size
+                    )));
+                }
+            }
+        }
+
+        // Per-sequence plan: absolute positions, the gathered KV row list, and
+        // the packed row range this sequence occupies.
+        struct Plan {
+            rows: Vec<usize>,
+            start: usize,
+            len: usize,
+            offset: usize,
+        }
+        let mut plans = Vec::with_capacity(inputs.len());
+        let mut total_rows = 0usize;
+        for input in inputs {
+            let len = input.tokens.len();
+            let total_len = input.start + len;
+            let slots = block_manager
+                .slot_mapping(input.seq, 0, total_len)
+                .map_err(|err| ModelError::Backend(err.to_string()))?;
+            plans.push(Plan {
+                rows: slots.iter().map(|&slot| slot as usize).collect(),
+                start: input.start,
+                len,
+                offset: total_rows,
+            });
+            total_rows += len;
+        }
+
+        let device = &self.device;
+        let packed_tokens: Vec<u32> = inputs
+            .iter()
+            .flat_map(|input| input.tokens.iter().copied())
+            .collect();
+        let positions: Vec<usize> = inputs
+            .iter()
+            .flat_map(|input| input.start..input.start + input.tokens.len())
+            .collect();
+        let input_ids =
+            Tensor::from_vec(packed_tokens, (1, total_rows), device).map_err(candle_error)?;
+        let mut hidden = self
+            .embed_tokens
+            .forward(&input_ids)
+            .map_err(candle_error)?
+            .reshape((total_rows, self.config.hidden_size))
+            .map_err(candle_error)?;
+        let n_rep = self.config.num_heads / self.config.num_kv_heads;
+
+        // One kernel launch for the whole batch when every sequence decodes a
+        // single token on the f16 CUDA path.
+        #[cfg(feature = "cuda")]
+        let batch_kernel =
+            if self.cuda_attention && inputs.iter().all(|input| input.tokens.len() == 1) {
+                let seqs: Vec<SeqId> = inputs.iter().map(|input| input.seq).collect();
+                match CudaDecodeContext::new(block_manager, &seqs, device, &self.config) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        warn_cuda_attention_fallback(&error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        let pools = Arc::clone(&self.pools);
+        let pools = pools
+            .lock()
+            .map_err(|_| ModelError::Backend("paged KV pool lock poisoned".to_string()))?;
+        // Write slots never change across layers; compute them once.
+        let write_slots: Vec<usize> = plans
+            .iter()
+            .flat_map(|plan| plan.rows[plan.start..plan.start + plan.len].iter().copied())
+            .collect();
+
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let residual = &hidden;
+            let normalized = layer
+                .input_layernorm
+                .forward(&hidden)
+                .map_err(candle_error)?;
+            let q = layer.q_proj.forward(&normalized).map_err(candle_error)?;
+            let k = layer.k_proj.forward(&normalized).map_err(candle_error)?;
+            let v = layer.v_proj.forward(&normalized).map_err(candle_error)?;
+
+            let q = q
+                .reshape((total_rows, self.config.num_heads, self.config.head_dim))
+                .map_err(candle_error)?;
+            let k = k
+                .reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+                .map_err(candle_error)?;
+            let v = v
+                .reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+                .map_err(candle_error)?;
+
+            let q = match &layer.q_norm {
+                Some(norm) => norm.forward(&q).map_err(candle_error)?,
+                None => q,
+            };
+            let k = match &layer.k_norm {
+                Some(norm) => norm.forward(&k).map_err(candle_error)?,
+                None => k,
+            };
+
+            let q = apply_rope_rows(&q, &self.cos, &self.sin, &positions).map_err(candle_error)?;
+            let k = apply_rope_rows(&k, &self.cos, &self.sin, &positions).map_err(candle_error)?;
+
+            write_kv_rows(
+                &pools.k[layer_index],
+                &pools.v[layer_index],
+                &k,
+                &v,
+                &write_slots,
+            )
+            .map_err(candle_error)?;
+
+            let mut attention_rows: Vec<Tensor> = Vec::with_capacity(plans.len());
+
+            // Custom-kernel output for the whole batch, when available.
+            #[cfg(feature = "cuda")]
+            let mut batch_attention: Option<Tensor> = None;
+            #[cfg(not(feature = "cuda"))]
+            let batch_attention: Option<Tensor> = None;
+            #[cfg(feature = "cuda")]
+            if let Some(context) = &batch_kernel {
+                // The kernel reads q as a flat [seqs, heads, head_dim] buffer,
+                // which is exactly the packed row layout here.
+                match context.attention(&q, &pools.k[layer_index], &pools.v[layer_index], device) {
+                    Ok(attention) => batch_attention = Some(attention),
+                    Err(error) => warn_cuda_attention_fallback(&error),
+                }
+            }
+
+            if let Some(attention) = batch_attention {
+                attention_rows.push(
+                    attention
+                        .reshape((total_rows, self.config.attention_width()))
+                        .map_err(candle_error)?,
+                );
+            } else {
+                for plan in &plans {
+                    let q_slice = q
+                        .narrow(0, plan.offset, plan.len)
+                        .and_then(|tensor| tensor.transpose(0, 1))
+                        .and_then(|tensor| tensor.unsqueeze(0))
+                        .map_err(candle_error)?;
+                    let rows = Tensor::from_vec(
+                        plan.rows
+                            .iter()
+                            .map(|&row| row as u32)
+                            .collect::<Vec<u32>>(),
+                        (plan.rows.len(),),
+                        device,
+                    )
+                    .map_err(candle_error)?;
+                    let mask = causal_mask(plan.start, plan.len, plan.start + plan.len, device)
+                        .map_err(candle_error)?;
+                    let attention = gather_attention(
+                        &q_slice,
+                        &pools.k[layer_index],
+                        &pools.v[layer_index],
+                        &rows,
+                        &mask,
+                        n_rep,
+                    )
+                    .map_err(candle_error)?;
+                    attention_rows.push(
+                        attention
+                            .squeeze(0)
+                            .and_then(|tensor| tensor.transpose(0, 1))
+                            .and_then(|tensor| {
+                                tensor.reshape((plan.len, self.config.attention_width()))
+                            })
+                            .map_err(candle_error)?,
+                    );
+                }
+            }
+            let attention = if attention_rows.len() == 1 {
+                attention_rows.pop().expect("one attention block")
+            } else {
+                Tensor::cat(&attention_rows.iter().collect::<Vec<_>>(), 0).map_err(candle_error)?
+            };
+            let attention = layer.o_proj.forward(&attention).map_err(candle_error)?;
+            hidden = residual.add(&attention).map_err(candle_error)?;
+
+            let residual = &hidden;
+            let normalized = layer
+                .post_attention_layernorm
+                .forward(&hidden)
+                .map_err(candle_error)?;
+            let gate = layer.gate_proj.forward(&normalized).map_err(candle_error)?;
+            let up = layer.up_proj.forward(&normalized).map_err(candle_error)?;
+            let activated = candle_nn::ops::silu(&gate).map_err(candle_error)?;
+            let mlp = layer
+                .down_proj
+                .forward(&activated.mul(&up).map_err(candle_error)?)
+                .map_err(candle_error)?;
+            hidden = residual.add(&mlp).map_err(candle_error)?;
+        }
+
+        let hidden = self.norm.forward(&hidden).map_err(candle_error)?;
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(&hidden).map_err(candle_error)?,
+            None => hidden
+                .matmul(&self.tied_weight.transpose(0, 1).map_err(candle_error)?)
+                .map_err(candle_error)?,
+        };
+        let flat = logits
+            .flatten_all()
+            .and_then(|tensor| tensor.to_dtype(DType::F32))
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(candle_error)?;
+        let vocabulary = self.config.vocab_size.max(1);
+
+        let mut per_input = Vec::with_capacity(inputs.len());
+        let mut cursor = 0usize;
+        for input in inputs {
+            let mut rows = Vec::with_capacity(input.tokens.len());
+            for _ in 0..input.tokens.len() {
+                let begin = cursor * vocabulary;
+                rows.push(flat[begin..begin + vocabulary].to_vec());
+                cursor += 1;
+            }
+            per_input.push(rows);
+        }
+        Ok(per_input)
     }
 
     fn copy_block(&mut self, src: usize, dst: usize) -> Result<(), ModelError> {
@@ -1256,6 +1606,18 @@ impl Executor for Qwen2Executor {
             .forward(block_manager, seq, tokens, start, all_logits)
     }
 
+    fn forward_decode_batch(
+        &mut self,
+        block_manager: &mut BlockSpaceManager,
+        inputs: &[DecodeInput<'_>],
+    ) -> Result<Vec<Vec<Vec<f32>>>, ModelError> {
+        self.model.forward_decode_batch(block_manager, inputs)
+    }
+
+    fn is_batched_decode(&self) -> bool {
+        true
+    }
+
     fn copy_block(&mut self, src: usize, dst: usize) -> Result<(), ModelError> {
         self.model.copy_block(src, dst)
     }
@@ -1466,6 +1828,128 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(difference < 1e-6, "rope difference {difference}");
+    }
+
+    /// Batched decode must produce the same logits as decoding each sequence
+    /// separately. This is the invariant the whole throughput win rests on.
+    #[test]
+    fn batched_decode_matches_per_sequence_decode() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F32, &device);
+
+        // Both models load from the same VarMap, so the weights are identical.
+        let mut batched = Qwen2Model::load(&config, &vb, device.clone(), 64, 4, 64).unwrap();
+        let mut sequential = Qwen2Model::load(&config, &vb, device, 64, 4, 64).unwrap();
+
+        // Three sequences with different prompts; decode one token each at a
+        // different absolute position so RoPE and per-sequence lengths differ.
+        let prompts: Vec<Vec<u32>> = vec![vec![1, 5, 2, 9], vec![7, 3, 8, 4, 6, 2], vec![9, 1]];
+        let tokens = [11u32, 12, 13];
+
+        let mut batched_manager = BlockSpaceManager::new(64, 4, 16);
+        let mut sequential_manager = BlockSpaceManager::new(64, 4, 16);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let seq = index + 1;
+            batched_manager
+                .match_or_allocate_prefix(seq, prompt)
+                .expect("allocate batched prompt");
+            sequential_manager
+                .match_or_allocate_prefix(seq, prompt)
+                .expect("allocate sequential prompt");
+        }
+
+        // Give each sequence a decoded token so the decode position is `len`.
+        let mut inputs = Vec::new();
+        for (index, (prompt, token)) in prompts.iter().zip(tokens).enumerate() {
+            let seq = index + 1;
+            batched_manager.append_tokens(seq, 1).unwrap();
+            sequential_manager.append_tokens(seq, 1).unwrap();
+            inputs.push((seq, token, prompt.len()));
+        }
+
+        let decode_inputs: Vec<DecodeInput<'_>> = inputs
+            .iter()
+            .map(|(seq, token, start)| DecodeInput {
+                seq: *seq,
+                tokens: std::slice::from_ref(token),
+                start: *start,
+            })
+            .collect();
+        let batched_logits = batched
+            .forward_decode_batch(&mut batched_manager, &decode_inputs)
+            .expect("batched decode");
+        assert_eq!(batched_logits.len(), inputs.len());
+
+        for (index, (seq, token, start)) in inputs.iter().enumerate() {
+            let expected = sequential
+                .forward(
+                    &mut sequential_manager,
+                    *seq,
+                    std::slice::from_ref(token),
+                    *start,
+                    false,
+                )
+                .expect("sequential decode");
+            let expected = &expected[0];
+            let actual = &batched_logits[index][0];
+            assert_eq!(actual.len(), expected.len());
+            let mut worst = 0f32;
+            for (a, b) in actual.iter().zip(expected.iter()) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst < 1e-4,
+                "sequence {seq}: batched logits differ from sequential by {worst}"
+            );
+        }
+        batched_manager.assert_invariants();
+        sequential_manager.assert_invariants();
+    }
+
+    /// A single-sequence batched call must equal a plain forward, so the pilot
+    /// path cannot diverge from the one it replaces.
+    #[test]
+    fn batched_decode_with_one_sequence_matches_plain_forward() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F32, &device);
+        let mut batched = Qwen2Model::load(&config, &vb, device.clone(), 64, 4, 64).unwrap();
+        let mut plain = Qwen2Model::load(&config, &vb, device, 64, 4, 64).unwrap();
+
+        let prompt: Vec<u32> = vec![3, 1, 4, 1, 5];
+        let mut batched_manager = BlockSpaceManager::new(64, 4, 16);
+        let mut plain_manager = BlockSpaceManager::new(64, 4, 16);
+        batched_manager
+            .match_or_allocate_prefix(1, &prompt)
+            .unwrap();
+        plain_manager.match_or_allocate_prefix(1, &prompt).unwrap();
+        batched_manager.append_tokens(1, 1).unwrap();
+        plain_manager.append_tokens(1, 1).unwrap();
+
+        let token = [7u32];
+        let start = prompt.len();
+        let batched_logits = batched
+            .forward_decode_batch(
+                &mut batched_manager,
+                &[DecodeInput {
+                    seq: 1,
+                    tokens: &token,
+                    start,
+                }],
+            )
+            .expect("batched decode");
+        let plain_logits = plain
+            .forward(&mut plain_manager, 1, &token, start, false)
+            .expect("plain decode");
+
+        let mut worst = 0f32;
+        for (a, b) in batched_logits[0][0].iter().zip(plain_logits[0].iter()) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(worst < 1e-6, "single-sequence batch differs by {worst}");
     }
 
     #[test]

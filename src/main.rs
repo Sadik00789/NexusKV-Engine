@@ -13,6 +13,9 @@ struct Cli {
     model: Option<PathBuf>,
     swap_dir: Option<PathBuf>,
     host_budget: usize,
+    blocks: Option<usize>,
+    block_size: Option<usize>,
+    max_seqs: Option<usize>,
 }
 
 #[tokio::main]
@@ -31,6 +34,33 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_args()?;
     #[allow(unused_mut)]
     let mut config = EngineConfig::default();
+    if let Some(blocks) = cli.blocks {
+        if blocks == 0 {
+            anyhow::bail!("--blocks must be at least 1");
+        }
+        config.total_physical_blocks = blocks;
+    }
+    if let Some(block_size) = cli.block_size {
+        if block_size == 0 {
+            anyhow::bail!("--block-size must be at least 1");
+        }
+        config.block_size = block_size;
+    }
+    if let Some(max_seqs) = cli.max_seqs {
+        if max_seqs == 0 {
+            anyhow::bail!("--max-seqs must be at least 1");
+        }
+        config.max_num_seqs = max_seqs;
+    }
+    // A smaller pool still has to hold one sequence's page table.
+    if config.total_physical_blocks < config.max_blocks_per_seq {
+        config.max_blocks_per_seq = config.total_physical_blocks;
+        tracing::warn!(
+            "max_blocks_per_seq clamped to {} to fit the {} block pool",
+            config.max_blocks_per_seq,
+            config.total_physical_blocks
+        );
+    }
     #[cfg(feature = "cuda")]
     if cli.model.is_some() && nexuskv::model::qwen::cuda_f32_requested() {
         config.clamp_for_f32_cuda();
@@ -161,6 +191,35 @@ fn parse_args() -> anyhow::Result<Cli> {
                 cli.host_budget = value
                     .parse()
                     .map_err(|error| anyhow::anyhow!("invalid --host-budget {value}: {error}"))?;
+            }
+            "--blocks" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--blocks requires a block count"))?;
+                cli.blocks = Some(
+                    value
+                        .parse()
+                        .map_err(|error| anyhow::anyhow!("invalid --blocks {value}: {error}"))?,
+                );
+            }
+            "--block-size" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--block-size requires a token count"))?;
+                cli.block_size =
+                    Some(value.parse().map_err(|error| {
+                        anyhow::anyhow!("invalid --block-size {value}: {error}")
+                    })?);
+            }
+            "--max-seqs" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-seqs requires a count"))?;
+                cli.max_seqs = Some(
+                    value
+                        .parse()
+                        .map_err(|error| anyhow::anyhow!("invalid --max-seqs {value}: {error}"))?,
+                );
             }
             other => anyhow::bail!("unknown argument {other}"),
         }

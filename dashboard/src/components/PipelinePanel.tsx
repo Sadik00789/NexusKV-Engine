@@ -7,6 +7,7 @@ import {
     HardDrive,
     ArrowRightLeft,
     Cpu,
+    Boxes,
 } from "lucide-react";
 
 export interface PipelineMetrics {
@@ -18,6 +19,14 @@ export interface PipelineMetrics {
     swapBytesOut: number;
     swapBytesIn: number;
     attentionBackend: string;
+    /** Executor fuses decode steps into one model forward. */
+    batchedDecode?: boolean;
+    /** Fused decode forwards executed. */
+    decodeBatches?: number;
+    /** Sequences covered by those forwards. */
+    decodeBatchSequences?: number;
+    /** Largest fused forward so far. */
+    maxDecodeBatch?: number;
 }
 
 interface PipelinePanelProps {
@@ -37,6 +46,12 @@ function attentionLabel(backend: string): string {
     if (backend === "gather") return "Gather";
     if (backend === "mock") return "Mock";
     return "Unknown";
+}
+
+/** Mean sequences per fused decode forward, e.g. "7.8". */
+function formatBatchSize(batches?: number, sequences?: number): string {
+    if (!batches || batches <= 0) return "0";
+    return ((sequences || 0) / batches).toFixed(1);
 }
 
 function NumberTile({
@@ -124,6 +139,21 @@ export const PipelinePanel: React.FC<PipelinePanelProps> = ({ metrics }) => {
                     detail={`out ${formatBytes(metrics.swapBytesOut)} · in ${formatBytes(metrics.swapBytesIn)}`}
                     icon={ArrowRightLeft}
                     accent="text-violet-400"
+                />
+                <NumberTile
+                    label="Decode batch"
+                    value={
+                        metrics.batchedDecode
+                            ? `${formatBatchSize(metrics.decodeBatches, metrics.decodeBatchSequences)}×`
+                            : "1×"
+                    }
+                    detail={
+                        metrics.batchedDecode
+                            ? `${(metrics.decodeBatches || 0).toLocaleString()} fused · max ${metrics.maxDecodeBatch || 0}`
+                            : "not fused by executor"
+                    }
+                    icon={Boxes}
+                    accent="text-teal-400"
                 />
                 <NumberTile
                     label="Attention"

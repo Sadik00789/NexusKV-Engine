@@ -40,8 +40,14 @@ function Resolve-CudaToolkit {
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($env:CUDA_HOME) { $candidates.Add($env:CUDA_HOME) }
     if ($env:CUDA_PATH) { $candidates.Add($env:CUDA_PATH) }
-    if ($env:USERPROFILE) { $candidates.Add((Join-Path $env:USERPROFILE 'cuda-12.6')) }
-    $candidates.Add('C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6')
+    if ($env:USERPROFILE) {
+        foreach ($version in @('13.4', '13.2', '12.6')) {
+            $candidates.Add((Join-Path $env:USERPROFILE ("cuda-" + $version)))
+        }
+    }
+    foreach ($version in @('v13.4', 'v13.2', 'v12.6')) {
+        $candidates.Add((Join-Path 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' $version))
+    }
     foreach ($candidate in $candidates) {
         if ($candidate -and (Test-CudaLayout -Path $candidate)) { return $candidate }
     }
@@ -85,15 +91,22 @@ function Initialize-NexusKvEnvironment {
     # nvcc's Windows default for -c objects is /MT; -Xcompiler /MD matches
     # Rust's dynamic CRT (otherwise MSVC fails at link time with a
     # RuntimeLibrary fail-if-mismatch). -cudart=shared selects the CUDA runtime.
-    $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler -Xcompiler /MD -cudart=shared'
+    # CUDA 13.x ships CCCL headers that reject MSVC's traditional preprocessor,
+    # so /Zc:preprocessor is required (harmless on CUDA 12.6).
+    $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler -Xcompiler /MD -Xcompiler /Zc:preprocessor -cudart=shared'
     $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
     if ($cl) { $env:NVCC_CCBIN = $cl.Source }
     if ($cuda) {
         $env:CUDA_PATH = $cuda
         $env:CUDA_HOME = $cuda
-        $cudaBin = Join-Path $cuda 'bin'
-        if (($env:PATH -split ';') -notcontains $cudaBin) {
-            $env:PATH = $cudaBin + ';' + $env:PATH
+        # CUDA 13 moved the runtime DLLs (cudart, cublas, curand, nvrtc) into
+        # bin\x64 while bin keeps the tools. Add both so the engine can load
+        # them at runtime; older toolkits only have bin and are unaffected.
+        foreach ($relative in @('bin', 'bin\x64')) {
+            $directory = Join-Path $cuda $relative
+            if ((Test-Path $directory) -and (($env:PATH -split ';') -notcontains $directory)) {
+                $env:PATH = $directory + ';' + $env:PATH
+            }
         }
     }
     return [pscustomobject]@{

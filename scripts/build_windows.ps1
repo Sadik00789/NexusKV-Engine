@@ -21,7 +21,8 @@ try {
     Write-Output ("CUDA toolkit:      " + $envInfo.CudaHome)
     if (-not $NoCuda -and -not $envInfo.CudaHome) {
         Write-Output 'ERROR: CUDA toolkit not found. Run scripts/check_env.ps1 for the exact fix.'
-        Write-Output 'Manual step: install CUDA Toolkit 12.6 for Windows, then set CUDA_PATH to its root.'
+        Write-Output 'No-admin install: powershell -ExecutionPolicy Bypass -File scripts/install_cuda_user.ps1'
+        Write-Output 'It installs CUDA 13.4.3 under %USERPROFILE%\cuda-13.4 (cudarc supports 12.6-13.4).'
         exit 1
     }
 

@@ -50,13 +50,13 @@ handlers relay measured telemetry to clients and the dashboard.
 ## Screenshots
 
 Live dashboard captured on the target machine with real Qwen3-0.6B f16 weights,
-`executor=real`, and the custom CUDA f16 decode kernel. The KV pipeline row shows
-measured prefill/skipped tokens, adaptive K, evictions, tier swap bytes, and the
-attention backend:
+`executor=real`, and the custom CUDA f16 decode kernel. The KV pipeline tiles show
+measured prefill/skipped tokens, adaptive K, evictions, tier swap bytes, decode
+batch size, and the attention backend:
 
 ![NexusKV live dashboard](docs/dashboard-live.png)
 
-Time-travel replay at tick 300 of the same run: a recorded keyframe plus memory
+Time-travel replay at tick 66 of the same run: a recorded keyframe plus memory
 events reconstructs the 6 active pages exactly. The HUD above keeps the last
 measured live performance values; only allocator state is replayed:
 
@@ -70,13 +70,14 @@ measured live performance values; only allocator state is replayed:
 | --- | --- |
 | Memory core | `Free`/`Active`/`Cached` state machine, radix trie, transactional prefix match/append/fork, copy-on-write tails, O(1) free-list guard, LRU eviction, pinned commits |
 | Engine | Single-writer actor, continuous batching, chunked prefill, decodes-first scheduling, starvation-free admission, preemption |
+| Batched decode | One fused model forward per scheduler step for every decoding sequence: all projections, QK-norm, RoPE, MLP, and lm_head run as batched GEMMs; paged attention runs per sequence, or as one multi-sequence custom-kernel launch when each sequence decodes one token |
 | Serving | OpenAI-compatible chat completions, SSE generation, measured TTFT/ITL/tokens-per-second, client-disconnect aborts |
 | Speculative decoding | Prompt-lookup n-gram drafter, distribution-exact rejection sampling, greedy verification, UCB1 adaptive `K` over `{0,2,4,8,16}` |
 | Sessions | Commit pins full-block KV prefixes, checkout resumes in O(1) and branches independently, forget releases pins |
 | Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, `GET /v1/timetravel?tick=N` |
 | Tiering | Content-addressed host LRU plus NVMe spill, demand page-in on `Swapped` trie hits, fault-injection coverage, NKV2 dtype-tagged spill files |
 | Real model | Dense Qwen3-0.6B (primary) and Qwen2.5-0.5B-Instruct (fallback) behind `candle-model` on CPU (f32) or `cuda` on GPU (f16); QK-norm, GQA, RoPE, SwiGLU, f32 norm/softmax accumulation |
-| CUDA | f16 `paged_decode_attention` with f32 accumulation and GQA-correct head mapping, enabled for decode by `NEXUSKV_CUDA_ATTENTION=1`, launched on candle's stream with automatic gather fallback; plus `reshape_and_cache` and `copy_block` |
+| CUDA | f16 `paged_decode_attention` with f32 accumulation and GQA-correct head mapping, enabled for decode by `NEXUSKV_CUDA_ATTENTION=1`, launched on candle's stream with automatic gather fallback; the kernel's `grid.x` covers the whole decode batch; plus `reshape_and_cache` and `copy_block` |
 | Prefix hits | KV-valid trie blocks skip prefill compute; a block-aligned full re-hit computes zero prefill tokens (measured `prefill_tokens` / `prefix_skip_tokens`) |
 | Execution targets | CPU and NVIDIA GPU: `candle-model` runs dense Qwen on CPU; `cuda` adds the GPU backend and custom decode kernel |
 | Default build | Mock executor; `cargo test` passes without a GPU, CUDA toolkit, or model weights |
@@ -158,6 +159,12 @@ sequences while others are decoding, so a long-running decode cannot starve new
 work. An admission OOM preempts the newest non-progressing sequence and requeues
 it.
 
+Each scheduler step decodes every ready sequence in **one fused forward**: the
+actor prepares all inputs (appends KV slots, materializes copy-on-write tails),
+calls `Executor::forward_decode_batch` once, then verifies and emits per
+sequence. Batched decode is a trait method with a safe per-sequence default, so
+the mock executor stays correct while `Qwen2Executor` fuses the real model.
+
 ### 3. Speculative decoding
 
 - `LookupDrafter` indexes 3-grams over the prompt and committed output, and
@@ -200,9 +207,14 @@ drops or the next candidate.
 Prerequisites:
 
 - Rust stable (2024 edition)
-- Optional: CUDA Toolkit 12.6, Visual Studio 2022 Build Tools, and an NVIDIA GPU
-  for the `cuda` feature
+- Optional: CUDA Toolkit **13.4** (or 12.6+), Visual Studio 2022 Build Tools, and
+  an NVIDIA GPU for the `cuda` feature
 - Node 22 and pnpm for the dashboard
+
+> **Toolkit ceiling.** candle 0.9.x depends on cudarc 0.19.10, whose build script
+> panics on any toolkit newer than **13.4**. CUDA 13.5 (current latest) cannot
+> build this checkout. `scripts/install_cuda_user.ps1` installs 13.4.3 without
+> Administrator rights.
 
 ### Mock mode (no GPU, no weights)
 
@@ -233,14 +245,25 @@ export CARGO_BUILD_JOBS=2
 # CPU backend
 cargo run --release --features candle-model -- --model /path/to/Qwen3-0.6B
 
-# NVIDIA GPU backend (requires an MSVC host toolchain and CUDA 12.6)
+# NVIDIA GPU backend (requires an MSVC host toolchain and CUDA 13.4)
 cargo run --release --features cuda -- --model /path/to/Qwen3-0.6B
 ```
 
 `candle-model` selects the CPU device; `cuda` selects the GPU and is the only
 feature set that compiles the custom kernel. With `cuda`, a missing CUDA device
 falls back to CPU with a warning. On Windows, use
-`scripts/build_windows.ps1` and `scripts/run_windows.ps1`.
+`scripts/install_cuda_user.ps1` once, then `scripts/build_windows.ps1` and
+`scripts/run_windows.ps1`.
+
+Pool sizing is adjustable for measurement and demos:
+
+```bash
+--blocks 24        # physical KV blocks (default 192)
+--block-size 16    # tokens per block
+--max-seqs 6       # concurrent sequences
+--swap-dir DIR     # enables host/NVMe tiering
+--host-budget N    # tier host budget in bytes (default 512 MiB)
+```
 
 The model directory must contain `config.json`, `tokenizer.json`, and at least
 one `*.safetensors` shard. Split checkpoints are loaded one shard at a time; a
@@ -252,7 +275,10 @@ with an explicit error.
 ### CUDA decode kernel (native Windows)
 
 ```powershell
-# Imports the VS x64 environment, resolves CUDA 12.6, and builds the engine.
+# One time: installs CUDA 13.4.3 under %USERPROFILE%\cuda-13.4 (no admin needed).
+powershell -ExecutionPolicy Bypass -File scripts/install_cuda_user.ps1
+
+# Imports the VS x64 environment, resolves CUDA, and builds the engine.
 powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 
 $env:NEXUSKV_CUDA_ATTENTION = "1"
@@ -260,10 +286,11 @@ powershell -ExecutionPolicy Bypass -File scripts/run_windows.ps1
 ```
 
 The custom f16 kernel handles decode (`seq_len == 1`) on candle's device stream;
-prefill keeps gather attention. Without the environment flag, or on any dtype or
-contiguity mismatch, the engine falls back to gather attention with a warning.
-GPU parity and compute-sanitizer tests are `#[ignore]`d for ordinary `cargo
-test`; run them on the target machine with:
+prefill keeps gather attention. Its `grid.x` is the sequence count, so a batched
+decode step is one kernel launch for the whole batch. Without the environment
+flag, or on any dtype or contiguity mismatch, the engine falls back to gather
+attention with a warning. GPU parity and compute-sanitizer tests are `#[ignore]`d
+for ordinary `cargo test`; run them on the target machine with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/test_gpu.ps1
@@ -283,6 +310,24 @@ cargo run --release --features candle-model -- \
 
 `--host-budget` is in bytes (default `512 MiB`). In mock mode the paging
 machinery is real, but block bytes are synthetic; startup logs a warning.
+
+To watch tiering actually fire, shrink the pool below the working set and drive
+both eviction and a demand page-in:
+
+```bash
+# 16 blocks, 4 sequences, tiering enabled
+cargo run --release --features cuda -- \
+  --model /path/to/Qwen3-0.6B --swap-dir /var/tmp/nexuskv-kv \
+  --blocks 16 --max-seqs 4
+
+# Shared prefix first, judged fillers to force eviction, then the same prefix
+# again so its swapped trie nodes are paged back in.
+python scripts/tiering_probe.py --clients 4 --fillers 12 --filler-blocks 6 --remeasure 4
+```
+
+The probe prints measured deltas: on this machine it produced 35 evictions
+(61.3 MiB written to the tier), one demand page-in (1.75 MiB), and 304
+prefix-skip tokens.
 
 ### Dashboard
 
@@ -376,7 +421,9 @@ curl http://127.0.0.1:8080/health
 
 `/v1/metrics` includes `event_tick`, live/cached/free block counts, prefix hit
 ratio, acceptance, adaptive `K`, evictions, page faults, CoW copies, preemptions,
-and tier counters (`swapped_out`, `swapped_in`, `disk_spills`, `disk_loads`).
+tier counters (`swapped_out`, `swapped_in`, `disk_spills`, `disk_loads`), and
+batched-decode counters (`batched_decode`, `decode_batches`,
+`decode_batch_sequences`, `max_decode_batch`).
 
 ---
 
@@ -407,29 +454,49 @@ evictions, page faults, and tier counters. `--prefix-probe` measures cold versus
 warm TTFT on a unique prompt re-hit. `--compare` prints the same-GPU/same-model
 llama.cpp comparison protocol; it does not assert a result on its own.
 
+**Medians, not single runs.** Laptop GPUs move between runs (clocks, thermals,
+Windows scheduling), so every headline number below is the median of three runs:
+
+```bash
+python scripts/bench_median.py --runs 3 -- --clients 4 --max-tokens 64 --spec
+```
+
+Each raw run is kept under `benches/results/` (gitignored local evidence).
+
 ### Measured on this machine (2026-11-11)
 
 | Item | Value |
 | --- | --- |
 | Hardware | NVIDIA RTX 3050 Laptop 4 GB, driver 621.01, 8 GB RAM, Windows 11 |
-| Toolchain | Rust 1.99.1 MSVC, CUDA Toolkit 12.6, Visual Studio 2022 Build Tools (MSVC 14.44) |
+| Toolchain | Rust 1.99.1 MSVC, CUDA Toolkit 13.4 (per-user redistributable), Visual Studio 2022 Build Tools (MSVC 14.44) |
 | Model | Qwen/Qwen3-0.6B, f16 weights and f16 KV pools |
-| Engine | 192 blocks × 16 tokens, max 8 sequences, custom CUDA f16 decode + gather prefill |
-| VRAM (nvidia-smi) | **1,753 MiB / 4,096 MiB** after model + KV pool + traffic |
-| 4 clients × 64 tokens, spec on | **23.76 tok/s** aggregate, 6.25 tok/s per client |
-| TTFT p50 / p99 | **641.4 ms / 706.3 ms** |
-| ITL p50 / p99 | **154.0 ms / 232.9 ms** |
-| Speculative acceptance / adaptive K | **4.5% / K=4** on this paraphrase prompt (not cherry-picked) |
-| Evictions / page faults / swap | 0 / 0 / 0 bytes (pool not under pressure in this run) |
+| Engine | 192 blocks × 16 tokens, max 8 sequences, batched decode, custom CUDA f16 decode + gather prefill |
+| VRAM (nvidia-smi) | **1,675 MiB / 4,096 MiB** after model + KV pool |
+| 4 clients × 64 tokens, spec on | **76.3 tok/s** aggregate median (24.6 tok/s per client), range 75.0–76.7 |
+| TTFT p50 / p99 (median of runs) | **131.4 ms / 196.9 ms** |
+| ITL p50 / p99 (median of runs) | **42.6 ms / 106.4 ms** |
+| 8 clients × 64 tokens, spec on | **111.4 tok/s** aggregate, 7.8 sequences per fused decode forward |
+| Speculative acceptance | **46.7% on quote/echo** (`scripts/spec_acceptance_probe.py`), **25.3% median** on the benchmark prompt; adaptive `K=4` |
+| Evictions / page faults / swap (192-block run) | 0 / 0 / 0 bytes (pool not under pressure) |
+| Forced tiering (16 blocks, 4 clients ÷ 4) | **35 evictions, 61.3 MiB swapped out, 1 demand page-in (1.75 MiB), 304 prefix-skip tokens**, no client errors |
 | 512-token aligned prefix re-hit | TTFT **243.6 ms → 3.01 ms (80.9×)**; cold prefill 512 tokens, warm prefill **0**, 512 skipped |
-| Dashboard single request (warm prefix) | 22.1 tok/s, TTFT 206.5 ms, ITL 44.1 ms |
+| Dashboard single request (warm prefix) | 22.0 tok/s, TTFT 59.1 ms, ITL 45.2 ms (median of 6 warm requests) |
 
-Raw JSON is written to `benches/results/` (gitignored local evidence):
-`rtx3050-qwen3-0.6b-f16.json` and `rtx3050-prefix-512.json`.
+Batched decode replaced one forward pass per sequence with one fused forward per
+scheduler step. On the same GPU, model, and prompt, 4 clients went from
+**23.76 tok/s** (one forward per sequence, recorded in the previous revision) to
+**76.3 tok/s** median — a **3.2×** aggregate gain. The measurement is visible in
+telemetry: `/v1/metrics` reports `batched_decode`, `decode_batches`,
+`decode_batch_sequences`, and `max_decode_batch`, so the fusion is countable
+rather than asserted.
+
+Raw JSON is written to `benches/results/` (gitignored local evidence), including
+`rtx3050-4c-median.json` for the median summary above.
 
 Mock-mode token rates measure bookkeeping and transport only and are never
-presented as model inference. The numbers above are single-run measurements on
-this GPU; they are not a comparison against another engine.
+presented as model inference. These numbers are single-machine measurements on
+this GPU and are not a comparison against another engine; run `--compare` with
+llama.cpp on the same device for that.
 
 ---
 
@@ -452,6 +519,9 @@ Coverage highlights:
   12k-operation pressure runs, and proptest refcount conservation.
 - Scheduler starvation/preemption units and actor lifecycle, abort, and
   shared-prefix integration.
+- Batched decode parity: fused logits match per-sequence decode on synthetic
+  weights (three sequences, distinct lengths and positions) and on real Qwen3
+  weights on the GPU, including greedy token identity across four steps.
 - HTTP/SSE/OpenAI schema, client disconnect, session commit/checkout/forget, and
   time-travel replay determinism.
 - Rejection-sampling statistics (400k seeded draws), greedy speculative/plain
@@ -506,6 +576,10 @@ nexuskv/
 ├── benches/bookkeeping.rs
 ├── scripts/
 │   ├── bench_e2e.py            # End-to-end SSE benchmark
+│   ├── bench_median.py         # N-run medians of the above
+│   ├── tiering_probe.py        # Forces eviction + demand page-in
+│   ├── spec_acceptance_probe.py# Quote/echo acceptance measurement
+│   ├── install_cuda_user.ps1   # Per-user CUDA 13.4 (no admin)
 │   ├── build.sh, sanitize.sh   # Linux/macOS helpers
 │   └── *.ps1                   # Windows environment/build/run/test scripts
 └── dashboard/                  # Next.js 15 telemetry and time-travel UI
@@ -519,9 +593,20 @@ nexuskv/
   (`NEXUSKV_CUDA_ATTENTION=1`, `seq_len == 1`). Prefill uses candle's gather
   attention; the kernel path falls back to gather on any dtype, contiguity, or
   launch mismatch with a one-time warning.
+- Batched decode fuses every weight GEMM, but paged attention is one gather
+  call per sequence unless the custom kernel is active and each sequence decodes
+  exactly one token, in which case the whole batch is a single kernel launch.
+  Speculative drafts therefore use the per-sequence gather path.
 - CUDA weights and KV pools are f16. `NEXUSKV_DTYPE=f32` is supported but
   automatically clamps the pool to 96 blocks and 4 sequences because f32 weights
   plus 192 f32 blocks do not fit in 4 GB.
+- The toolkit ceiling is CUDA **13.4**: candle 0.9.x → cudarc 0.19.10 panics on
+  newer majors. CUDA 13.5 cannot build this checkout until candle moves to a
+  newer cudarc.
+- compute-sanitizer needs a one-time **Administrator** step
+  (`EnableDebuggerInterface.bat`) to attach on WDDM. Until that is done the
+  script exits 2 and reports the run as uninstrumented rather than clean; see
+  [WINDOWS_SETUP.md](WINDOWS_SETUP.md#7-gpu-tests).
 - A single sequence cannot exceed the resident block pool: active blocks are not
   evictable. The 8-block/200-token tiering end-to-end test completes 200 tokens
   across sequences with a shared prefix, forcing swap-out and page-in between

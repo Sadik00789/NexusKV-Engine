@@ -104,27 +104,50 @@ if ($cl -and $vcvars) {
     Add-Row 'FAIL' 'MSVC cl.exe' $detail 'Install Visual Studio 2022 Build Tools with the "Desktop development with C++" workload'
 }
 
-# 3. CUDA toolkit and nvcc version
+# 3. CUDA toolkit and nvcc version.
+# cudarc 0.19.10 (candle 0.9.x) knows CUDA 12.6 through 13.4 and panics on
+# anything newer, so the ceiling is a hard requirement, not a preference.
+$minimumCuda = [version]'12.6'
+$maximumCuda = [version]'13.4'
+function Test-CudaVersionSupported {
+    param([string]$Version)
+    if (-not $Version) { return $false }
+    try {
+        $parsed = [version]$Version
+    } catch {
+        return $false
+    }
+    return ($parsed -ge $minimumCuda -and $parsed -le $maximumCuda)
+}
+
 $cuda = $envInfo.CudaHome
 if ($cuda) {
     Add-Row 'PASS' 'CUDA toolkit' $cuda ''
-    if ($envInfo.CudaVersion -eq '12.6') {
-        Add-Row 'PASS' 'nvcc version' '12.6' ''
+    if (Test-CudaVersionSupported $envInfo.CudaVersion) {
+        Add-Row 'PASS' 'nvcc version' $envInfo.CudaVersion ''
     } elseif ($envInfo.CudaVersion) {
-        Add-Row 'FAIL' 'nvcc version' ("found " + $envInfo.CudaVersion + ", require 12.6") 'Install CUDA Toolkit 12.6 and point CUDA_PATH at it (do not use 13.x with candle 0.9)'
+        Add-Row 'FAIL' 'nvcc version' ("found " + $envInfo.CudaVersion + ", supported 12.6-13.4") 'Install CUDA 13.4 (scripts/install_cuda_user.ps1) and point CUDA_PATH at it; cudarc 0.19.10 panics on newer toolkits'
     } else {
-        Add-Row 'FAIL' 'nvcc version' 'could not parse nvcc --version' 'Reinstall CUDA Toolkit 12.6 or repair the toolkit'
+        Add-Row 'FAIL' 'nvcc version' 'could not parse nvcc --version' 'Reinstall CUDA 13.4 or repair the toolkit'
     }
     $cudart = Join-Path $cuda 'lib\x64\cudart.lib'
     if (Test-Path $cudart) {
         Add-Row 'PASS' 'CUDA lib' $cudart ''
     } else {
-        Add-Row 'FAIL' 'CUDA lib' ($cudart + ' missing') 'Install the CUDA 12.6 runtime/development libraries into the toolkit root'
+        Add-Row 'FAIL' 'CUDA lib' ($cudart + ' missing') 'Install the CUDA 13.4 runtime/development libraries into the toolkit root'
+    }
+    # CUDA 13 keeps the runtime DLLs in bin\x64; the engine must be able to load them.
+    $runtimeDlls = @(Get-ChildItem (Join-Path $cuda 'bin\x64') -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem (Join-Path $cuda 'bin') -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)
+    if ($runtimeDlls.Count -gt 0) {
+        Add-Row 'PASS' 'CUDA runtime' $runtimeDlls[0].Name ''
+    } else {
+        Add-Row 'FAIL' 'CUDA runtime' 'cudart64_*.dll not found under bin or bin\x64' 'Reinstall the cuda_cudart component (scripts/install_cuda_user.ps1)'
     }
 } else {
-    Add-Row 'FAIL' 'CUDA toolkit' 'CUDA_HOME/CUDA_PATH and conventional paths were not found' 'Install CUDA Toolkit 12.6 for Windows, set CUDA_PATH to its root, then re-run this script'
-    Add-Row 'FAIL' 'nvcc version' 'not found' 'Install CUDA Toolkit 12.6 for Windows'
-    Add-Row 'FAIL' 'CUDA lib' 'lib\x64\cudart.lib not found' 'Install the CUDA 12.6 runtime/development libraries'
+    Add-Row 'FAIL' 'CUDA toolkit' 'CUDA_HOME/CUDA_PATH and conventional paths were not found' 'Run scripts/install_cuda_user.ps1 (no admin needed), then re-run this script'
+    Add-Row 'FAIL' 'nvcc version' 'not found' 'Install CUDA 13.4 for Windows'
+    Add-Row 'FAIL' 'CUDA lib' 'lib\x64\cudart.lib not found' 'Install the CUDA 13.4 runtime/development libraries'
 }
 
 # 4. NVIDIA GPU and driver

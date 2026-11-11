@@ -23,9 +23,18 @@ try {
     }
     $sanitizer = Join-Path $envInfo.CudaHome 'bin\compute-sanitizer.exe'
     if (-not (Test-Path $sanitizer)) {
-        Write-Output ("ERROR: compute-sanitizer.exe not found at " + $sanitizer)
-        Write-Output 'Install the CUDA 12.6 sanitizer API component or use the full toolkit installer.'
+        $sanitizer = Join-Path $envInfo.CudaHome 'compute-sanitizer\compute-sanitizer.exe'
+    }
+    if (-not (Test-Path $sanitizer)) {
+        Write-Output ("ERROR: compute-sanitizer.exe not found under " + $envInfo.CudaHome)
+        Write-Output 'Install the cuda_sanitizer_api component (scripts/install_cuda_user.ps1 does this).'
         exit 1
+    }
+    # The redistributable layout keeps sanitizer DLLs next to the executable;
+    # make them resolvable for the child process.
+    $sanitizerDir = Split-Path -Parent $sanitizer
+    if (($env:PATH -split ';') -notcontains $sanitizerDir) {
+        $env:PATH = $sanitizerDir + ';' + $env:PATH
     }
 
     Write-Output '--- building CUDA test binary ---'
