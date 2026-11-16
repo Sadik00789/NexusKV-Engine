@@ -217,6 +217,10 @@ export default function Home() {
                                 data.prefix_skip_tokens ?? previous.prefixSkipTokens
                             ),
                             adaptiveK: Number(data.adaptive_k ?? previous.adaptiveK),
+                            evictions: Number(data.evictions ?? previous.evictions),
+                            pageFaults: Number(data.page_faults ?? previous.pageFaults),
+                            swapBytesOut: Number(data.swap_bytes_out ?? previous.swapBytesOut),
+                            swapBytesIn: Number(data.swap_bytes_in ?? previous.swapBytesIn),
                             attentionBackend: String(
                                 data.attention_backend ?? previous.attentionBackend
                             ),
@@ -293,7 +297,7 @@ export default function Home() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     session: sessionName,
-                    parent: null,
+                    parent: nodeId,
                     label: `checkpoint-${sequenceId}`,
                     seq: sequenceId,
                 }),
@@ -593,7 +597,7 @@ export default function Home() {
                             />
                             <button
                                 onClick={commitCheckpoint}
-                                disabled={isGenerating || sequenceId === undefined || sessionBusy}
+                                disabled={sequenceId === undefined || sessionBusy}
                                 className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-violet-700 hover:bg-violet-600 disabled:bg-slate-800 disabled:text-slate-500 transition-colors"
                             >
                                 Commit

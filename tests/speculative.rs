@@ -62,6 +62,30 @@ async fn generate(state: &AppState, prompt: &[u8], max_tokens: usize, spec: bool
     tokens
 }
 
+fn prompt_offset_bytes(prompt: &[u8]) -> u32 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &token in prompt {
+        hash = (hash ^ u64::from(token)).wrapping_mul(0x1000_0000_01b3);
+    }
+    (hash as u32) % 256
+}
+
+fn prompt_with_continuation(offset: u32) -> Vec<u8> {
+    let t0 = (3 * u32::from(b'c') + 7 * u32::from(b'b') + 1 + offset) % 256;
+    let t1 = (3 * t0 + 7 * u32::from(b'c') + 1 + offset) % 256;
+    let t2 = (3 * t1 + 7 * t0 + 1 + offset) % 256;
+    for nonce in 0..20_000u32 {
+        let mut candidate = format!("p{offset}-{nonce}:").into_bytes();
+        candidate.extend_from_slice(&[
+            b'b', b'c', t0 as u8, t1 as u8, t2 as u8, b'z', b'a', b'b', b'c',
+        ]);
+        if prompt_offset_bytes(&candidate) == offset {
+            return candidate;
+        }
+    }
+    panic!("failed to construct prompt for offset {offset}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn greedy_speculative_matches_plain_decoding_on_twenty_prompts() {
     let state = AppState::with_executor(
@@ -72,9 +96,9 @@ async fn greedy_speculative_matches_plain_decoding_on_twenty_prompts() {
     );
 
     for index in 0..20 {
-        let prompt = format!("abcabcabc{index}abcabcabc");
-        let plain = generate(&state, prompt.as_bytes(), 18, false).await;
-        let speculative = generate(&state, prompt.as_bytes(), 18, true).await;
+        let prompt = prompt_with_continuation(index as u32);
+        let plain = generate(&state, &prompt, 18, false).await;
+        let speculative = generate(&state, &prompt, 18, true).await;
         assert_eq!(
             plain, speculative,
             "speculative greedy output diverged for prompt {index}"
@@ -144,4 +168,78 @@ async fn speculative_runs_under_a_small_pool_stay_consistent() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("engine retained active blocks after bounded speculative runs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_decode_step_observes_first_emitted_token() {
+    fn prompt_offset(prompt: &[u32]) -> u32 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &token in prompt {
+            hash = (hash ^ u64::from(token)).wrapping_mul(0x1000_0000_01b3);
+        }
+        (hash as u32) % 256
+    }
+
+    let state = AppState::with_executor(
+        spec_config(),
+        Box::new(nexuskv::model::MockExecutor::new()),
+        Arc::new(MockTokenizer),
+        "nexuskv-mock-v1",
+    );
+
+    // Exhaust the K=0 warmup arm so the target sequence picks K=2 on its first decode step.
+    let _ = generate(&state, b"warm", 2, true).await;
+
+    // For offset=0 and trailing [10, 20], MockExecutor emits t0=131 then t1=22.
+    // The prompt ends with [22, 10, 20] (unique), so only observing t0=131 makes
+    // the 3-gram [10, 20, 131] match the earlier [10, 20, 131, 22, ...].
+    let mut prompt = vec![0u32, 10, 20, 131, 22, 10, 20];
+    let nonce = (0..10_000u32)
+        .find(|&candidate| {
+            prompt[0] = candidate % 256;
+            prompt_offset(&prompt) == 0
+        })
+        .expect("find zero-offset prompt");
+    prompt[0] = nonce % 256;
+
+    let seq = state.next_sequence_id();
+    let (tx, mut rx) = unbounded_channel();
+    state
+        .request_tx
+        .send(Request::Generate(GenerateJob {
+            seq,
+            prompt,
+            max_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            spec: true,
+            tx,
+        }))
+        .unwrap();
+
+    let mut emitted = Vec::new();
+    while let Some(msg) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out")
+    {
+        match msg {
+            TokenMsg::Token { id, .. } => emitted.push(id),
+            TokenMsg::Done { .. } => break,
+            TokenMsg::Error { message } => panic!("unexpected error: {message}"),
+        }
+    }
+    assert_eq!(emitted[..2], [131, 22]);
+
+    for _ in 0..100 {
+        let snapshot = state.snapshot();
+        if snapshot.speculative_proposed > 0 {
+            assert!(
+                snapshot.speculative_accepted >= 1,
+                "first decode step must accept the draft after the first emitted token"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("first decode step never proposed drafts from the first emitted token");
 }

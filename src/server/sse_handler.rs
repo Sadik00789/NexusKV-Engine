@@ -3,7 +3,7 @@ use crate::config::EngineConfig;
 use crate::engine::{
     EngineActor, GenerateJob, Request, Scheduler, Snapshot, TelemetrySink, TokenMsg,
 };
-use crate::memory::{BlockIo, BlockSpaceManager, FlightRecorder, MemEvent};
+use crate::memory::{BlockIo, BlockSpaceManager, FlightRecorder};
 use crate::model::{Executor, MockExecutor, MockTokenizer, Tokenizer};
 use axum::{
     extract::{Path, Query, State},
@@ -102,18 +102,7 @@ impl AppState {
             config.block_size,
         )));
         let recorder = Arc::new(Mutex::new(FlightRecorder::default()));
-        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MemEvent>(8192);
-        let recorder_thread = Arc::clone(&recorder);
-        std::thread::Builder::new()
-            .name("nexuskv-flight-recorder".to_string())
-            .spawn(move || {
-                while let Ok(event) = event_rx.recv() {
-                    if let Ok(mut recorder) = recorder_thread.lock() {
-                        recorder.record_event(event);
-                    }
-                }
-            })
-            .expect("failed to start the flight recorder thread");
+        let recorder_sink = Arc::clone(&recorder);
 
         let (request_tx, request_rx) = unbounded_channel();
         let scheduler = Scheduler::new(config.max_num_seqs, config.max_num_batched_tokens);
@@ -130,10 +119,12 @@ impl AppState {
                 config.max_blocks_per_seq,
             ),
         };
-        // Non-blocking telemetry: dropping an event under extreme pressure is
-        // preferable to stalling the allocator; keyframes keep replay bounded.
+        // Record directly into the flight recorder on the actor thread so
+        // keyframes and event ticks stay synchronized without a background lag.
         block_manager.set_event_sink(Box::new(move |event| {
-            let _ = event_tx.try_send(event);
+            if let Ok(mut recorder) = recorder_sink.lock() {
+                recorder.record_event(event);
+            }
         }));
         let actor = EngineActor::new(
             request_rx,
@@ -229,6 +220,14 @@ pub struct TelemetryPayload {
     pub attention_backend: String,
     pub prefill_tokens: u64,
     pub prefix_skip_tokens: u64,
+    pub batched_decode: bool,
+    pub decode_batches: u64,
+    pub decode_batch_sequences: u64,
+    pub max_decode_batch: usize,
+    pub evictions: u64,
+    pub page_faults: u64,
+    pub swap_bytes_out: u64,
+    pub swap_bytes_in: u64,
     pub active_block_ids: Vec<usize>,
     pub event_tick: u64,
     pub is_finished: bool,
@@ -387,6 +386,20 @@ fn make_guard(state: &AppState, seq_id: usize, completed: Arc<AtomicBool>) -> Ab
     }
 }
 
+fn sanitize_temperature(temperature: Option<f32>) -> f32 {
+    match temperature {
+        Some(value) if value.is_finite() => value.max(0.0),
+        _ => 0.7,
+    }
+}
+
+fn sanitize_top_p(top_p: Option<f32>) -> f32 {
+    match top_p {
+        Some(value) if value.is_finite() => value.clamp(1e-6, 1.0),
+        _ => 1.0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn telemetry_payload(
     state: &AppState,
@@ -430,6 +443,14 @@ fn telemetry_payload(
         attention_backend: snapshot.attention_backend,
         prefill_tokens: snapshot.prefill_tokens,
         prefix_skip_tokens: snapshot.prefix_skip_tokens,
+        batched_decode: snapshot.batched_decode,
+        decode_batches: snapshot.decode_batches,
+        decode_batch_sequences: snapshot.decode_batch_sequences,
+        max_decode_batch: snapshot.max_decode_batch,
+        evictions: snapshot.evictions,
+        page_faults: snapshot.page_faults,
+        swap_bytes_out: snapshot.swap_bytes_out,
+        swap_bytes_in: snapshot.swap_bytes_in,
         active_block_ids,
         event_tick: snapshot.event_tick,
         is_finished,
@@ -456,8 +477,8 @@ pub async fn stream_generation(
         seq: seq_id,
         prompt: prompt_tokens,
         max_tokens: payload.max_tokens.max(1),
-        temperature: payload.temperature.unwrap_or(0.7).max(0.0),
-        top_p: payload.top_p.unwrap_or(1.0),
+        temperature: sanitize_temperature(payload.temperature),
+        top_p: sanitize_top_p(payload.top_p),
         spec: payload.spec,
         tx,
     };
@@ -661,8 +682,8 @@ pub async fn checkout_session(
         seq: seq_id,
         prompt: Vec::new(),
         max_tokens: payload.max_tokens.max(1),
-        temperature: payload.temperature.unwrap_or(0.7).max(0.0),
-        top_p: payload.top_p.unwrap_or(1.0),
+        temperature: sanitize_temperature(payload.temperature),
+        top_p: sanitize_top_p(payload.top_p),
         spec: payload.spec,
         tx,
     };
@@ -784,8 +805,8 @@ pub async fn chat_completions(
 
     let seq_id = state.next_sequence_id();
     let max_tokens = payload.max_tokens.unwrap_or(64).max(1);
-    let temperature = payload.temperature.unwrap_or(0.7).max(0.0);
-    let top_p = payload.top_p.unwrap_or(1.0);
+    let temperature = sanitize_temperature(payload.temperature);
+    let top_p = sanitize_top_p(payload.top_p);
     let model = payload.model.clone();
     let completion_id = generation_id(seq_id);
     let created = unix_timestamp();

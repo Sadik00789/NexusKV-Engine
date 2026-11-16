@@ -370,3 +370,112 @@ async fn timetravel_route_returns_keyframe_and_events() {
         at_zero["keyframe"]["blocks"].as_array().unwrap().len()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_commit_checkout_forget_works_after_sequence_completion() {
+    let state = AppState::mock(test_config());
+    let (url, _server) = spawn_server(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let body = client
+        .post(format!("{url}/v1/generate/stream"))
+        .json(&json!({
+            "prompt": "completed sequence prompt spanning several blocks",
+            "max_tokens": 6,
+            "temperature": 0.0
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let events: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect();
+    let finished = events.last().expect("final SSE event");
+    assert_eq!(finished["is_finished"], true);
+    let seq = finished["sequence_id"].as_u64().expect("sequence id");
+
+    let commit_res = client
+        .post(format!("{url}/v1/sessions/commit"))
+        .json(&json!({
+            "session": "completed",
+            "parent": null,
+            "label": "after-finish",
+            "seq": seq
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        commit_res.status().is_success(),
+        "commit after completion must succeed, got {}",
+        commit_res.status()
+    );
+    let commit: Value = commit_res.json().await.unwrap();
+    let root = commit["node"].as_u64().expect("root node id");
+    assert!(
+        state.snapshot().active_blocks > 0,
+        "post-completion commit must pin full blocks"
+    );
+
+    let child_commit: Value = client
+        .post(format!("{url}/v1/sessions/commit"))
+        .json(&json!({
+            "session": "completed",
+            "parent": root,
+            "label": "child-branch",
+            "seq": seq
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child = child_commit["node"].as_u64().expect("child node id");
+
+    let tree: Value = client
+        .get(format!("{url}/v1/sessions/completed/tree"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tree["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(tree["nodes"][1]["parent"], root);
+
+    let checkout_body = client
+        .post(format!("{url}/v1/sessions/checkout"))
+        .json(&json!({
+            "node": child,
+            "max_tokens": 4,
+            "temperature": 0.0
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(checkout_body.contains("\"is_finished\":true"));
+
+    client
+        .post(format!("{url}/v1/sessions/forget"))
+        .json(&json!({"node": child}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{url}/v1/sessions/forget"))
+        .json(&json!({"node": root}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wait_active_baseline(&state, 0).await, 0);
+}

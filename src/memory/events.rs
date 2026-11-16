@@ -135,9 +135,11 @@ pub fn replay_state(replay: &Replay) -> Vec<BlockInspectInfo> {
                     if entry.ref_count == 0 {
                         if event.cached {
                             entry.is_free = false;
+                            entry.is_prefix_cached = true;
                             entry.state = "cached".to_string();
                         } else {
                             entry.is_free = true;
+                            entry.is_prefix_cached = false;
                             entry.state = "free".to_string();
                         }
                     } else {
@@ -148,6 +150,7 @@ pub fn replay_state(replay: &Replay) -> Vec<BlockInspectInfo> {
                 MemEventKind::Evict => {
                     entry.ref_count = 0;
                     entry.is_free = true;
+                    entry.is_prefix_cached = false;
                     entry.state = "free".to_string();
                 }
                 MemEventKind::Cow | MemEventKind::Rollback | MemEventKind::Fault => {}

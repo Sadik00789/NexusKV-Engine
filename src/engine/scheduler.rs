@@ -44,6 +44,9 @@ pub struct Seq {
     /// store. Admission must not re-run prefix matching for it.
     pub attached: bool,
     pub rng_state: u64,
+    /// Valid prefix tokens credited at admission that have not yet entered a
+    /// dispatched batch; subtracted if preempted before running any forward.
+    pub(crate) unconsumed_skip_tokens: usize,
 }
 
 impl Seq {
@@ -75,6 +78,7 @@ impl Seq {
             spec,
             attached: false,
             rng_state,
+            unconsumed_skip_tokens: 0,
         }
     }
 
@@ -241,6 +245,7 @@ impl Scheduler {
                         // KV-valid hits are a prefix; everything after the
                         // first unwritten block is recomputed.
                         seq.computed = matched.valid_tokens;
+                        seq.unconsumed_skip_tokens = matched.valid_tokens;
                         self.skipped_prefill_tokens += matched.valid_tokens as u64;
                     }
                     let computed = seq.computed;
@@ -291,6 +296,17 @@ impl Scheduler {
             }
         }
 
+        for chunk in &batch.prefill {
+            if let Some(seq) = self.running.get_mut(&chunk.seq) {
+                seq.unconsumed_skip_tokens = 0;
+            }
+        }
+        for id in &batch.first_token {
+            if let Some(seq) = self.running.get_mut(id) {
+                seq.unconsumed_skip_tokens = 0;
+            }
+        }
+
         debug_assert!(batch.token_count() <= self.max_num_batched_tokens);
         batch
     }
@@ -309,6 +325,10 @@ impl Scheduler {
         self.order.retain(|running| *running != victim);
         let mut seq = self.running.remove(&victim)?;
         let _ = block_manager.free_sequence(victim);
+        self.skipped_prefill_tokens = self
+            .skipped_prefill_tokens
+            .saturating_sub(seq.unconsumed_skip_tokens as u64);
+        seq.unconsumed_skip_tokens = 0;
         seq.computed = 0;
         seq.out.clear();
         seq.attached = false;

@@ -251,9 +251,12 @@ pub struct EngineActor {
     decode_batches: u64,
     decode_batch_sequences: u64,
     max_decode_batch: usize,
+    completed_sequences: HashMap<SeqId, Vec<u32>>,
+    completed_order: VecDeque<SeqId>,
 }
 
 const PREFILL_LOGIT_CACHE_ENTRIES: usize = 8;
+const COMPLETED_SEQUENCE_HISTORY: usize = 64;
 
 fn prompt_key(tokens: &[u32]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ (tokens.len() as u64);
@@ -295,6 +298,8 @@ impl EngineActor {
             decode_batches: 0,
             decode_batch_sequences: 0,
             max_decode_batch: 0,
+            completed_sequences: HashMap::new(),
+            completed_order: VecDeque::new(),
         }
     }
 
@@ -407,25 +412,8 @@ impl EngineActor {
                 seq,
                 reply,
             } => {
-                let tokens = match self.scheduler.seq(seq) {
-                    Some(seq) => {
-                        let mut tokens = seq.prompt.clone();
-                        tokens.extend_from_slice(&seq.out);
-                        tokens
-                    }
-                    None => {
-                        let _ = reply.send(Err(format!("sequence {seq} is not resident")));
-                        return;
-                    }
-                };
-                let result = self.sessions.commit(
-                    &session,
-                    parent,
-                    &label,
-                    seq,
-                    tokens,
-                    &mut self.block_manager,
-                );
+                let result = self.commit_sequence(&session, parent, &label, seq);
+                self.publish();
                 let _ = reply.send(result);
             }
             Request::Checkout { node, job } => {
@@ -467,6 +455,7 @@ impl EngineActor {
             }
             Request::Forget { node, reply } => {
                 let result = self.sessions.forget(node, &mut self.block_manager);
+                self.publish();
                 let _ = reply.send(result);
             }
             Request::SessionTree { session, reply } => {
@@ -624,6 +613,9 @@ impl EngineActor {
         }
         self.apply_pending_copies();
         let eos = self.emit_token(seq_id, token);
+        if let Some(drafter) = self.drafters.get_mut(&seq_id) {
+            drafter.observe(&[token]);
+        }
         let maxed = self
             .scheduler
             .seq(seq_id)
@@ -951,6 +943,59 @@ impl EngineActor {
         is_eos
     }
 
+    fn remember_completed(&mut self, seq: SeqId, tokens: Vec<u32>) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.completed_sequences.entry(seq)
+        {
+            entry.insert(tokens);
+            return;
+        }
+        while self.completed_order.len() >= COMPLETED_SEQUENCE_HISTORY {
+            if let Some(evicted) = self.completed_order.pop_front() {
+                self.completed_sequences.remove(&evicted);
+            }
+        }
+        self.completed_order.push_back(seq);
+        self.completed_sequences.insert(seq, tokens);
+    }
+
+    fn commit_sequence(
+        &mut self,
+        session: &str,
+        parent: Option<u64>,
+        label: &str,
+        seq: SeqId,
+    ) -> Result<u64, String> {
+        if let Some(live) = self.scheduler.seq(seq) {
+            let mut tokens = live.prompt.clone();
+            tokens.extend_from_slice(&live.out);
+            return self.sessions.commit(
+                session,
+                parent,
+                label,
+                seq,
+                tokens,
+                &mut self.block_manager,
+            );
+        }
+        let Some(tokens) = self.completed_sequences.get(&seq).cloned() else {
+            return Err(format!("sequence {seq} is not resident"));
+        };
+        if self.block_manager.page_table(seq).is_some() {
+            return Err(format!("sequence {seq} already has a page table"));
+        }
+        let aligned_len =
+            (tokens.len() / self.block_manager.block_size) * self.block_manager.block_size;
+        self.block_manager
+            .match_or_allocate_prefix_with_validity(seq, &tokens[..aligned_len])
+            .map_err(|err| err.to_string())?;
+        let result =
+            self.sessions
+                .commit(session, parent, label, seq, tokens, &mut self.block_manager);
+        let _ = self.block_manager.free_sequence(seq);
+        result
+    }
+
     fn finish_sequence(&mut self, seq_id: SeqId, reason: FinishReason) {
         if let Some(seq) = self.scheduler.finish(seq_id, &mut self.block_manager) {
             if let Some(ttft) = seq.ttft() {
@@ -958,6 +1003,11 @@ impl EngineActor {
                 while self.ttfts.len() > 512 {
                     self.ttfts.pop_front();
                 }
+            }
+            if !matches!(reason, FinishReason::Error | FinishReason::Aborted) {
+                let mut tokens = seq.prompt.clone();
+                tokens.extend_from_slice(&seq.out);
+                self.remember_completed(seq_id, tokens);
             }
             let _ = seq.tx.send(TokenMsg::Done { reason });
         }

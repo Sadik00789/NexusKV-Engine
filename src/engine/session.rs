@@ -142,11 +142,15 @@ impl SessionStore {
 
         block_manager.attach_snapshot(seq, &node.pinned, full_tokens, full_tokens);
         let tail = node.tokens.len().saturating_sub(full_tokens);
-        if tail > 0
-            && let Err(error) = block_manager.append_tokens(seq, tail)
-        {
-            let _ = block_manager.free_sequence(seq);
-            return Err(error.to_string());
+        if tail > 0 {
+            if let Err(error) = block_manager.append_tokens(seq, tail) {
+                let _ = block_manager.free_sequence(seq);
+                return Err(error.to_string());
+            }
+            if let Err(error) = block_manager.set_prompt_len(seq, node.tokens.len()) {
+                let _ = block_manager.free_sequence(seq);
+                return Err(error.to_string());
+            }
         }
 
         // Recompute the last resident token when the checkpoint is block
@@ -359,6 +363,7 @@ mod tests {
         let after = block_manager.allocated();
         assert_eq!(after, before + 1, "only the partial tail may allocate");
         assert_eq!(block_manager.logical_tokens(2), Some(10));
+        assert_eq!(block_manager.prompt_len(2), Some(10));
         block_manager.assert_invariants();
     }
 

@@ -58,6 +58,7 @@ export function applyReplay(
                     block.ref_count = Math.max(0, block.ref_count - 1);
                     if (block.ref_count === 0) {
                         block.is_free = !event.cached;
+                        block.is_prefix_cached = Boolean(event.cached);
                         block.state = event.cached ? "cached" : "free";
                     } else {
                         block.is_free = false;
@@ -67,6 +68,7 @@ export function applyReplay(
                 case "evict":
                     block.ref_count = 0;
                     block.is_free = true;
+                    block.is_prefix_cached = false;
                     block.state = "free";
                     break;
                 case "cow":

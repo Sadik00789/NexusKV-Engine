@@ -969,6 +969,22 @@ impl BlockSpaceManager {
         Ok(())
     }
 
+    /// Update a sequence's pinned prompt boundary without changing its blocks.
+    pub fn set_prompt_len(&mut self, seq: SeqId, prompt_len: usize) -> Result<(), MemoryError> {
+        let table = self
+            .page_tables
+            .get_mut(&seq)
+            .ok_or(MemoryError::SequenceNotFound(seq))?;
+        if prompt_len > table.logical_tokens {
+            return Err(MemoryError::InvalidBlock(format!(
+                "prompt_len {prompt_len} exceeds {} logical tokens",
+                table.logical_tokens
+            )));
+        }
+        table.prompt_len = prompt_len;
+        Ok(())
+    }
+
     /// Pin a committed block: the refcount is not backed by a page table entry.
     pub fn pin(&mut self, block: BlockId) -> Result<(), MemoryError> {
         if block >= self.total_blocks || self.states[block] == BlockState::Free {
