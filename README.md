@@ -42,6 +42,7 @@ handlers relay measured telemetry to clients and the dashboard.
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
 - [Project layout](#project-layout)
+- [Documentation](#architecture) ([Architecture](docs/ARCHITECTURE.md) · [Benchmarks](docs/BENCHMARKS.md) · [Windows Setup](WINDOWS_SETUP.md))
 - [Known limitations](#known-limitations)
 - [License](#license)
 
@@ -49,16 +50,19 @@ handlers relay measured telemetry to clients and the dashboard.
 
 ## Screenshots
 
-Live dashboard captured on the target machine with real Qwen3-0.6B f16 weights,
-`executor=real`, and the custom CUDA f16 decode kernel. The KV pipeline tiles show
-measured prefill/skipped tokens, adaptive K, evictions, tier swap bytes, decode
-batch size, and the attention backend:
+Live dashboard captured on the target machine (`v1.0.0`) with real Qwen3-0.6B
+f16 weights, `executor=real`, and the custom CUDA f16 decode kernel
+(`custom-cuda-f16`). The KV pipeline tiles show measured prefill/skipped tokens,
+UCB1 adaptive K, evictions, tier swap bytes, decode batch size, and the
+attention backend (`15.8 tok/s`, `619.1 ms` cold TTFT, `42.6 ms` ITL, `19.4%`
+speculative alpha):
 
 ![NexusKV live dashboard](docs/dashboard-live.png)
 
-Time-travel replay at tick 66 of the same run: a recorded keyframe plus memory
-events reconstructs the 6 active pages exactly. The HUD above keeps the last
-measured live performance values; only allocator state is replayed:
+Time-travel replay at tick 52 / 89 of the same run alongside a post-completion
+session commit (`#1 checkpoint-1 · 85 tokens · 5 pinned blocks`): a recorded
+keyframe plus memory events reconstructs the `5 / 192` active pages (`2.6%`
+VRAM pool) deterministically without fabricating telemetry:
 
 ![NexusKV time-travel dashboard](docs/dashboard-time-travel.png)
 
@@ -69,15 +73,15 @@ measured live performance values; only allocator state is replayed:
 | Area | State |
 | --- | --- |
 | Memory core | `Free`/`Active`/`Cached` state machine, radix trie, transactional prefix match/append/fork, copy-on-write tails, O(1) free-list guard, LRU eviction, pinned commits |
-| Engine | Single-writer actor, continuous batching, chunked prefill, decodes-first scheduling, starvation-free admission, preemption |
-| Batched decode | One fused model forward per scheduler step for every decoding sequence: all projections, QK-norm, RoPE, MLP, and lm_head run as batched GEMMs; paged attention runs per sequence, or as one multi-sequence custom-kernel launch when each sequence decodes one token |
-| Serving | OpenAI-compatible chat completions, SSE generation, measured TTFT/ITL/tokens-per-second, client-disconnect aborts |
-| Speculative decoding | Prompt-lookup n-gram drafter, distribution-exact rejection sampling, greedy verification, UCB1 adaptive `K` over `{0,2,4,8,16}` |
-| Sessions | Commit pins full-block KV prefixes, checkout resumes in O(1) and branches independently, forget releases pins |
-| Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, `GET /v1/timetravel?tick=N` |
-| Tiering | Content-addressed host LRU plus NVMe spill, demand page-in on `Swapped` trie hits, fault-injection coverage, NKV2 dtype-tagged spill files |
+| Engine | Single-writer actor, continuous batching, chunked prefill, decodes-first scheduling, starvation-free admission, preemption with skip-token rollback |
+| Batched decode | One fused model forward per scheduler step for every decoding sequence: fused `qkv_proj` & `gate_up_proj` projections, unified `lm_head`, loop-hoisted RoPE/mask tensors, and a single multi-sequence custom CUDA decode launch when each sequence decodes one token |
+| Serving | OpenAI-compatible chat completions, SSE generation, measured TTFT/ITL/tokens-per-second, client-disconnect aborts, `-h`/`--help` and `-V`/`--version` |
+| Speculative decoding | Prompt-lookup 3-gram drafter (observing prompt + first sampled token + subsequent decodes), distribution-exact rejection sampling, greedy verification, UCB1 adaptive `K` over `{0,2,4,8,16}` |
+| Sessions | Commit pins full-block KV prefixes both mid-stream and post-completion (`64`-entry history), synchronous snapshot publish, checkout resumes in O(1) and branches independently (`parent: nodeId`), forget releases pins |
+| Time travel | 50k-event ring buffer, keyframes at most 256 ticks apart, synchronous flush on session mutations, `GET /v1/timetravel?tick=N` |
+| Tiering | Content-addressed host LRU plus NVMe spill, demand page-in on `Swapped` trie hits with transactional OOM rollback preservation, fault-injection coverage, NKV2 dtype-tagged spill files |
 | Real model | Dense Qwen3-0.6B (primary) and Qwen2.5-0.5B-Instruct (fallback) behind `candle-model` on CPU (f32) or `cuda` on GPU (f16); QK-norm, GQA, RoPE, SwiGLU, f32 norm/softmax accumulation |
-| CUDA | f16 `paged_decode_attention` with f32 accumulation and GQA-correct head mapping, enabled for decode by `NEXUSKV_CUDA_ATTENTION=1`, launched on candle's stream with automatic gather fallback; the kernel's `grid.x` covers the whole decode batch; plus `reshape_and_cache` and `copy_block` |
+| CUDA | f16 `paged_decode_attention` with f32 accumulation and GQA-correct head mapping, enabled for decode by `NEXUSKV_CUDA_ATTENTION=1`, exact written-token `kv_lens`, launched on candle's stream with automatic gather fallback |
 | Prefix hits | KV-valid trie blocks skip prefill compute; a block-aligned full re-hit computes zero prefill tokens (measured `prefill_tokens` / `prefix_skip_tokens`) |
 | Execution targets | CPU and NVIDIA GPU: `candle-model` runs dense Qwen on CPU; `cuda` adds the GPU backend and custom decode kernel |
 | Default build | Mock executor; `cargo test` passes without a GPU, CUDA toolkit, or model weights |
@@ -320,14 +324,12 @@ cargo run --release --features cuda -- \
   --model /path/to/Qwen3-0.6B --swap-dir /var/tmp/nexuskv-kv \
   --blocks 16 --max-seqs 4
 
-# Shared prefix first, judged fillers to force eviction, then the same prefix
+# Shared prefix first, fillers to force eviction, then the same prefix
 # again so its swapped trie nodes are paged back in.
-python scripts/tiering_probe.py --clients 4 --fillers 12 --filler-blocks 6 --remeasure 4
+python scripts/tiering_probe.py --clients 4 --fillers 12 --filler-blocks 6 --remeasure 4 --max-tokens 32
 ```
 
-The probe prints measured deltas: on this machine it produced 35 evictions
-(61.3 MiB written to the tier), one demand page-in (1.75 MiB), and 304
-prefix-skip tokens.
+The probe prints measured deltas: in `v1.0.0` on this machine it generated `640` tokens (`0` errors) with `35` evictions (`61.25 MiB` written to the tier), one demand page-in (`1.75 MiB`), and `304` prefix-skip tokens.
 
 ### Dashboard
 
@@ -463,35 +465,39 @@ python scripts/bench_median.py --runs 3 -- --clients 4 --max-tokens 64 --spec
 
 Each raw run is kept under `benches/results/` (gitignored local evidence).
 
-### Measured on this machine (2026-11-11)
+### Measured on this machine (`v1.0.0`, 2026-11-16)
+
+Full benchmark tables, raw run arrays, and CPU Criterion bookkeeping numbers live in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | Item | Value |
 | --- | --- |
-| Hardware | NVIDIA RTX 3050 Laptop 4 GB, driver 621.01, 8 GB RAM, Windows 11 |
-| Toolchain | Rust 1.99.1 MSVC, CUDA Toolkit 13.4 (per-user redistributable), Visual Studio 2022 Build Tools (MSVC 14.44) |
-| Model | Qwen/Qwen3-0.6B, f16 weights and f16 KV pools |
-| Engine | 192 blocks × 16 tokens, max 8 sequences, batched decode, custom CUDA f16 decode + gather prefill |
-| VRAM (nvidia-smi) | **1,675 MiB / 4,096 MiB** after model + KV pool |
-| 4 clients × 64 tokens, spec on | **76.3 tok/s** aggregate median (24.6 tok/s per client), range 75.0–76.7 |
-| TTFT p50 / p99 (median of runs) | **131.4 ms / 196.9 ms** |
-| ITL p50 / p99 (median of runs) | **42.6 ms / 106.4 ms** |
-| 8 clients × 64 tokens, spec on | **111.4 tok/s** aggregate, 7.8 sequences per fused decode forward |
-| Speculative acceptance | **46.7% on quote/echo** (`scripts/spec_acceptance_probe.py`), **25.3% median** on the benchmark prompt; adaptive `K=4` |
-| Evictions / page faults / swap (192-block run) | 0 / 0 / 0 bytes (pool not under pressure) |
-| Forced tiering (16 blocks, 4 clients ÷ 4) | **35 evictions, 61.3 MiB swapped out, 1 demand page-in (1.75 MiB), 304 prefix-skip tokens**, no client errors |
-| 512-token aligned prefix re-hit | TTFT **243.6 ms → 3.01 ms (80.9×)**; cold prefill 512 tokens, warm prefill **0**, 512 skipped |
-| Dashboard single request (warm prefix) | 22.0 tok/s, TTFT 59.1 ms, ITL 45.2 ms (median of 6 warm requests) |
+| Hardware | NVIDIA RTX 3050 Laptop 4 GB, 8 GB RAM, Windows 11 |
+| Toolchain | Rust MSVC (`1.100` CI / local), CUDA Toolkit 13.4 (per-user redistributable), Visual Studio 2022 Build Tools |
+| Model | `Qwen/Qwen3-0.6B`, f16 weights and f16 KV pools (`28` layers, fused `qkv_proj` + `gate_up_proj`, hoisted RoPE/masks) |
+| Engine | 192 blocks × 16 tokens, max 8 sequences, batched decode, custom CUDA f16 decode (`NEXUSKV_CUDA_ATTENTION=1`) + gather prefill |
+| VRAM (`nvidia-smi` / startup log) | **1,739 MiB / 4,096 MiB** after model + 192-block KV pool (`75 MiB` idle before load) |
+| 4 clients × 64 tokens, spec on | **85.01 tok/s** aggregate median (`22.01 tok/s` per-client median; runs `[65.41, 86.19, 85.01]`) |
+| TTFT `p50` / `p99` (4-client median) | **120.29 ms / 189.14 ms** |
+| ITL `p50` / `p99` (4-client median) | **40.83 ms / 128.14 ms** |
+| 8 clients × 64 tokens, spec on | **136.25 tok/s** aggregate median (`17.83 tok/s` per-client median; runs `[139.15, 136.25, 132.65]`; `380` decode batches, `2,241` batch seqs, `max 8`) |
+| Speculative acceptance | **57.5% on quote/echo** (`scripts/spec_acceptance_probe.py`, `adaptive_k=4`); `2.2%`–`3.1%` median on diverse multi-client prompts |
+| Evictions / page faults / swap (192-block run) | `0 / 0 / 0` bytes (pool not under pressure) |
+| Forced tiering (16 blocks, 4 clients, 32 tokens) | **640 tokens (`0` errors), 35 evictions (`61.25 MiB` out), 1 demand page-in (`1.75 MiB`), 304 prefix-skip tokens** |
+| 512-token aligned prefix re-hit | TTFT **252.89 ms → 21.47 ms (11.78×)**; cold prefill `512` tokens, warm prefill **`0`**, `512` skipped |
+| Dashboard single request (`docs/dashboard-live.png`) | `15.8 tok/s`, TTFT `619.1 ms`, ITL `42.6 ms`, `19.4%` Spec Alpha (`2` adaptive K), `custom-cuda-f16` |
+| CPU bookkeeping (`cargo bench --bench bookkeeping`) | Prefix hit **`2.43 µs`**, alloc/free **`4.90 µs`**, 64-token `O(1)` rollback **`598.9 ns`** *(allocator only, not inference)* |
 
 Batched decode replaced one forward pass per sequence with one fused forward per
-scheduler step. On the same GPU, model, and prompt, 4 clients went from
-**23.76 tok/s** (one forward per sequence, recorded in the previous revision) to
-**76.3 tok/s** median — a **3.2×** aggregate gain. The measurement is visible in
-telemetry: `/v1/metrics` reports `batched_decode`, `decode_batches`,
-`decode_batch_sequences`, and `max_decode_batch`, so the fusion is countable
-rather than asserted.
+scheduler step, and `v1.0.0` weight fusion (`qkv_proj`, `gate_up_proj`),
+loop-hoisted RoPE/mask tensors, and exact written-KV CUDA contexts raised 4-client
+median throughput from `76.3 tok/s` to **`85.01 tok/s`** and 8-client throughput
+from `111.4 tok/s` to **`136.25 tok/s`**. Telemetry in `/v1/metrics` reports
+`batched_decode`, `decode_batches`, `decode_batch_sequences`, and
+`max_decode_batch` so fusion is directly countable.
 
-Raw JSON is written to `benches/results/` (gitignored local evidence), including
-`rtx3050-4c-median.json` for the median summary above.
+Raw JSON summaries (`rtx3050-4c-v1-median.json`, `rtx3050-8c-v1-median.json`,
+`rtx3050-prefix-512-v1.json`, `rtx3050-tiering-v1.json`) stay on disk under
+`benches/results/` (gitignored local evidence).
 
 Mock-mode token rates measure bookkeeping and transport only and are never
 presented as model inference. These numbers are single-machine measurements on
@@ -533,12 +539,13 @@ Coverage highlights:
   acceptance defaults, or dashboard playback simulations.
 
 GPU tests are the only `#[ignore]`d tests. Each carries a hardware comment and is
-run on the target machine with `scripts/test_gpu.ps1` (f32/f16 kernel parity, f16
-GQA parity against the CPU oracle, real-weight logit L2 parity plus greedy token
-identity, and real-model determinism). `scripts/sanitize.ps1` runs
-compute-sanitizer; on Windows WDDM it requires the one-time Administrator step
-documented in [WINDOWS_SETUP.md](WINDOWS_SETUP.md#7-gpu-tests). If that interface
-is not enabled, the script exits 2 rather than claiming a clean run.
+run on the target machine with `scripts/test_gpu.ps1` (`--lib --test real_model`
+for f32/f16 kernel parity, f16 GQA parity against the CPU oracle, real-weight
+logit L2 parity plus greedy token identity, and real-model determinism).
+`scripts/sanitize.ps1` runs compute-sanitizer; on Windows WDDM it requires the
+one-time Administrator step documented in
+[WINDOWS_SETUP.md](WINDOWS_SETUP.md#7-gpu-tests). If that interface is not
+enabled, the script exits 2 rather than claiming a clean run.
 
 ---
 
@@ -551,6 +558,11 @@ nexuskv/
 ├── src/build_support.rs        # CUDA root/flag resolution, unit-tested
 ├── DECISIONS.md                # Engineering decisions and recorded deviations
 ├── WINDOWS_SETUP.md            # Native Windows 11 setup
+├── docs/
+│   ├── ARCHITECTURE.md         # Internal subsystems, data flow, and HTTP API reference
+│   ├── BENCHMARKS.md           # Full v1.0.0 measured GPU & CPU benchmark methodology
+│   ├── dashboard-live.png      # Live CUDA telemetry screenshot
+│   └── dashboard-time-travel.png # Flight Recorder replay + committed session screenshot
 ├── LICENSE                     # MIT
 ├── csrc/
 │   └── paged_attention.cu      # Online-softmax decode + KV kernels

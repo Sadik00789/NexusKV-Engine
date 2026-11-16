@@ -167,7 +167,7 @@ mock server is labeled `MOCK` in the UI and `"executor": "mock"` in the API.
 powershell -ExecutionPolicy Bypass -File scripts/test_gpu.ps1
 ```
 
-Runs `cargo test --features cuda -- --ignored --test-threads=1` and then
+Runs `cargo test --features cuda --lib --test real_model -- --ignored --test-threads=1` and then
 `scripts/sanitize.ps1` (`compute-sanitizer.exe` from the toolkit). The GPU-only
 tests are `#[ignore]`d so the default `cargo test` stays GPU-free.
 
@@ -239,7 +239,7 @@ python scripts/spec_acceptance_probe.py --url http://127.0.0.1:8080 --max-tokens
 
 # Force tiering: shared prefix, fillers to evict it, then re-request to page in.
 python scripts/tiering_probe.py --url http://127.0.0.1:8080 `
-  --clients 4 --fillers 12 --filler-blocks 6 --remeasure 4
+  --clients 4 --fillers 12 --filler-blocks 6 --remeasure 4 --max-tokens 32
 ```
 
 `--prefix-probe` submits a unique prompt twice and reports the measured
