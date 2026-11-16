@@ -970,10 +970,8 @@ impl Qwen2Model {
                     None => k,
                 };
 
-                let q =
-                    apply_rope_precomputed(&q, &cos_slice, &sin_slice).map_err(candle_error)?;
-                let k =
-                    apply_rope_precomputed(&k, &cos_slice, &sin_slice).map_err(candle_error)?;
+                let q = apply_rope_precomputed(&q, &cos_slice, &sin_slice).map_err(candle_error)?;
+                let k = apply_rope_precomputed(&k, &cos_slice, &sin_slice).map_err(candle_error)?;
 
                 write_kv_block(&pools.k[layer_index], &pools.v[layer_index], &k, &v, &slots)
                     .map_err(candle_error)?;
