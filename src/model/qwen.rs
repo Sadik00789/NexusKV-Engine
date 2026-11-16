@@ -211,8 +211,49 @@ fn log_vram(stage: &str) {
 
 fn load_linear(vb: NnVarBuilder<'_>, in_dim: usize, out_dim: usize) -> anyhow::Result<Linear> {
     let weight = vb.get((out_dim, in_dim), "weight")?;
-    let bias = vb.get(out_dim, "bias").ok();
+    let bias = if vb.contains_tensor("bias") {
+        Some(vb.get(out_dim, "bias")?)
+    } else {
+        None
+    };
     Ok(Linear::new(weight, bias))
+}
+
+/// Concatenate multiple projections sharing the same input hidden state into one
+/// fused weight matrix (and bias vector when any projection supplies a bias).
+fn load_fused_linear(parts: &[(NnVarBuilder<'_>, usize)], in_dim: usize) -> anyhow::Result<Linear> {
+    let mut weights = Vec::with_capacity(parts.len());
+    let mut maybe_biases = Vec::with_capacity(parts.len());
+    let mut any_bias = false;
+    for (part_vb, out_dim) in parts {
+        let weight = part_vb.get((*out_dim, in_dim), "weight")?;
+        let bias = if part_vb.contains_tensor("bias") {
+            any_bias = true;
+            Some(part_vb.get(*out_dim, "bias")?)
+        } else {
+            None
+        };
+        weights.push(weight);
+        maybe_biases.push((bias, *out_dim));
+    }
+    let dtype = weights[0].dtype();
+    let device = weights[0].device().clone();
+    let weight_refs: Vec<&Tensor> = weights.iter().collect();
+    let fused_weight = Tensor::cat(&weight_refs, 0)?;
+    let fused_bias = if any_bias {
+        let mut biases = Vec::with_capacity(maybe_biases.len());
+        for (bias, out_dim) in maybe_biases {
+            match bias {
+                Some(bias) => biases.push(bias),
+                None => biases.push(Tensor::zeros(out_dim, dtype, &device)?),
+            }
+        }
+        let bias_refs: Vec<&Tensor> = biases.iter().collect();
+        Some(Tensor::cat(&bias_refs, 0)?)
+    } else {
+        None
+    };
+    Ok(Linear::new(fused_weight, fused_bias))
 }
 
 struct RmsNorm {
@@ -240,9 +281,7 @@ impl RmsNorm {
 }
 
 struct Qwen2Layer {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv_proj: Linear,
     o_proj: Linear,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -250,8 +289,7 @@ struct Qwen2Layer {
     /// do not ship these tensors, so the loader keeps them optional.
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: Linear,
     down_proj: Linear,
 }
 
@@ -281,9 +319,14 @@ impl Qwen2Layer {
             None
         };
         Ok(Self {
-            q_proj: load_linear(attention.pp("q_proj"), hidden, attention_width)?,
-            k_proj: load_linear(attention.pp("k_proj"), hidden, kv_width)?,
-            v_proj: load_linear(attention.pp("v_proj"), hidden, kv_width)?,
+            qkv_proj: load_fused_linear(
+                &[
+                    (attention.pp("q_proj"), attention_width),
+                    (attention.pp("k_proj"), kv_width),
+                    (attention.pp("v_proj"), kv_width),
+                ],
+                hidden,
+            )?,
             o_proj: load_linear(attention.pp("o_proj"), attention_width, hidden)?,
             input_layernorm: RmsNorm::load(vb.pp("input_layernorm"), hidden, config.rms_norm_eps)?,
             post_attention_layernorm: RmsNorm::load(
@@ -293,8 +336,13 @@ impl Qwen2Layer {
             )?,
             q_norm,
             k_norm,
-            gate_proj: load_linear(mlp.pp("gate_proj"), hidden, config.intermediate_size)?,
-            up_proj: load_linear(mlp.pp("up_proj"), hidden, config.intermediate_size)?,
+            gate_up_proj: load_fused_linear(
+                &[
+                    (mlp.pp("gate_proj"), config.intermediate_size),
+                    (mlp.pp("up_proj"), config.intermediate_size),
+                ],
+                hidden,
+            )?,
             down_proj: load_linear(mlp.pp("down_proj"), config.intermediate_size, hidden)?,
         })
     }
@@ -311,6 +359,23 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> CandleResult<Tensor> {
     expanded.reshape((batch, kv_heads * n_rep, seq_len, head_dim))
 }
 
+/// Apply rotary embeddings using pre-sliced/pre-gathered `cos` and `sin`
+/// tables so callers can hoist position selection out of the transformer loop.
+fn apply_rope_precomputed(x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
+    let dtype = x.dtype();
+    let head_dim = x.dim(D::Minus1)?;
+    let half = head_dim / 2;
+    // RoPE accumulates in f32 even when the weights and KV pools are f16.
+    let x = x.to_dtype(DType::F32)?;
+    let first = x.narrow(D::Minus1, 0, half)?;
+    let second = x.narrow(D::Minus1, half, half)?;
+    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
+    x.broadcast_mul(cos)?
+        .add(&rotated.broadcast_mul(sin)?)?
+        .to_dtype(dtype)
+}
+
+#[cfg(test)]
 fn apply_rope(
     x: &Tensor,
     cos: &Tensor,
@@ -318,48 +383,9 @@ fn apply_rope(
     start: usize,
     seq_len: usize,
 ) -> CandleResult<Tensor> {
-    let dtype = x.dtype();
-    let head_dim = x.dim(D::Minus1)?;
-    let half = head_dim / 2;
     let cos = cos.narrow(0, start, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
     let sin = sin.narrow(0, start, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
-    // RoPE accumulates in f32 even when the weights and KV pools are f16.
-    let x = x.to_dtype(DType::F32)?;
-    let first = x.narrow(D::Minus1, 0, half)?;
-    let second = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
-    x.broadcast_mul(&cos)?
-        .add(&rotated.broadcast_mul(&sin)?)?
-        .to_dtype(dtype)
-}
-
-/// RoPE for packed decode rows. Each row of `x` (`[rows, heads, head_dim]`) is
-/// one sequence position, so the rotary table is gathered per row rather than
-/// sliced once.
-fn apply_rope_rows(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &[usize],
-) -> CandleResult<Tensor> {
-    let dtype = x.dtype();
-    let head_dim = x.dim(D::Minus1)?;
-    let half = head_dim / 2;
-    let count = positions.len();
-    let index = Tensor::from_vec(
-        positions.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
-        (count,),
-        x.device(),
-    )?;
-    let cos = cos.index_select(&index, 0)?.reshape((count, 1, head_dim))?;
-    let sin = sin.index_select(&index, 0)?.reshape((count, 1, head_dim))?;
-    let x = x.to_dtype(DType::F32)?;
-    let first = x.narrow(D::Minus1, 0, half)?;
-    let second = x.narrow(D::Minus1, half, half)?;
-    let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
-    x.broadcast_mul(&cos)?
-        .add(&rotated.broadcast_mul(&sin)?)?
-        .to_dtype(dtype)
+    apply_rope_precomputed(x, &cos, &sin)
 }
 
 /// Write packed decode rows `[rows, kv_heads, head_dim]` into the paged KV pool
@@ -405,7 +431,7 @@ fn gather_attention(
     k_pool: &Tensor,
     v_pool: &Tensor,
     slots: &Tensor,
-    mask: &Tensor,
+    mask: Option<&Tensor>,
     n_rep: usize,
 ) -> CandleResult<Tensor> {
     let k = k_pool
@@ -430,7 +456,16 @@ fn gather_attention(
     // Softmax and the probability × value accumulation both run in f32 for f16
     // pools; only the final attention output is narrowed back.
     let scores = scores.to_dtype(DType::F32)?;
-    let scores = scores.broadcast_add(&mask.to_dtype(DType::F32)?)?;
+    let scores = match mask {
+        Some(mask) => {
+            if mask.dtype() == DType::F32 {
+                scores.broadcast_add(mask)?
+            } else {
+                scores.broadcast_add(&mask.to_dtype(DType::F32)?)?
+            }
+        }
+        None => scores,
+    };
     let probabilities = candle_nn::ops::softmax_last_dim(&scores)?;
     // Keep the probability × value accumulation in f32 as well; this matches
     // the custom kernel's accumulation and avoids a second f16 rounding before
@@ -676,8 +711,7 @@ pub struct Qwen2Model {
     embed_tokens: Embedding,
     layers: Vec<Qwen2Layer>,
     norm: RmsNorm,
-    lm_head: Option<Linear>,
-    tied_weight: Tensor,
+    lm_head: Linear,
     cos: Tensor,
     sin: Tensor,
     pools: Arc<Mutex<QwenKvPools>>,
@@ -722,17 +756,13 @@ impl Qwen2Model {
         }
         let norm = RmsNorm::load(model_vb.pp("norm"), hidden, config.rms_norm_eps)?;
 
-        let tied_weight = embed_tokens.embeddings().clone();
         let lm_head = if config.tie_word_embeddings || !vb.contains_tensor("lm_head.weight") {
             if !config.tie_word_embeddings {
                 tracing::warn!("lm_head.weight missing; using tied embeddings");
             }
-            None
+            Linear::new(embed_tokens.embeddings().clone(), None)
         } else {
-            Some(Linear::new(
-                vb.get((vocab, hidden), "lm_head.weight")?,
-                None,
-            ))
+            Linear::new(vb.get((vocab, hidden), "lm_head.weight")?, None)
         };
 
         let (cos, sin) = rope_tables(
@@ -773,7 +803,6 @@ impl Qwen2Model {
             layers,
             norm,
             lm_head,
-            tied_weight,
             cos,
             sin,
             pools: Arc::new(Mutex::new(QwenKvPools {
@@ -854,10 +883,31 @@ impl Qwen2Model {
             .embed_tokens
             .forward(&input_ids)
             .map_err(candle_error)?;
-        let mask = causal_mask(start, seq_len, total_len, device).map_err(candle_error)?;
+        // Single-token decode attends over every preceding key without masking;
+        // omit the all-zero mask allocation and broadcast_add.
+        let mask = if seq_len > 1 {
+            Some(causal_mask(start, seq_len, total_len, device).map_err(candle_error)?)
+        } else {
+            None
+        };
+        let cos_slice = self
+            .cos
+            .narrow(0, start, seq_len)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(candle_error)?;
+        let sin_slice = self
+            .sin
+            .narrow(0, start, seq_len)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(candle_error)?;
         let slot_tensor =
             Tensor::from_vec(slot_indices, (total_len,), device).map_err(candle_error)?;
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
+        let attention_width = self.config.attention_width();
+        let kv_width = self.config.num_kv_heads * self.config.head_dim;
+        let intermediate_size = self.config.intermediate_size;
         #[cfg(feature = "cuda")]
         let cuda_context = if use_cuda_kernel && seq_len == 1 {
             match CudaDecodeContext::new(block_manager, &[seq], &[total_len], device, &self.config)
@@ -885,20 +935,29 @@ impl Qwen2Model {
                     .input_layernorm
                     .forward(&hidden)
                     .map_err(candle_error)?;
-                let q = layer.q_proj.forward(&normalized).map_err(candle_error)?;
-                let k = layer.k_proj.forward(&normalized).map_err(candle_error)?;
-                let v = layer.v_proj.forward(&normalized).map_err(candle_error)?;
-
-                let q = q
-                    .reshape((1, seq_len, self.config.num_heads, self.config.head_dim))
+                let qkv = layer.qkv_proj.forward(&normalized).map_err(candle_error)?;
+                let q = qkv
+                    .narrow(D::Minus1, 0, attention_width)
+                    .and_then(|tensor| tensor.contiguous())
+                    .and_then(|tensor| {
+                        tensor.reshape((1, seq_len, self.config.num_heads, self.config.head_dim))
+                    })
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
-                let k = k
-                    .reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
+                let k = qkv
+                    .narrow(D::Minus1, attention_width, kv_width)
+                    .and_then(|tensor| tensor.contiguous())
+                    .and_then(|tensor| {
+                        tensor.reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
+                    })
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
-                let v = v
-                    .reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
+                let v = qkv
+                    .narrow(D::Minus1, attention_width + kv_width, kv_width)
+                    .and_then(|tensor| tensor.contiguous())
+                    .and_then(|tensor| {
+                        tensor.reshape((1, seq_len, self.config.num_kv_heads, self.config.head_dim))
+                    })
                     .and_then(|tensor| tensor.transpose(1, 2))
                     .map_err(candle_error)?;
 
@@ -912,9 +971,9 @@ impl Qwen2Model {
                 };
 
                 let q =
-                    apply_rope(&q, &self.cos, &self.sin, start, seq_len).map_err(candle_error)?;
+                    apply_rope_precomputed(&q, &cos_slice, &sin_slice).map_err(candle_error)?;
                 let k =
-                    apply_rope(&k, &self.cos, &self.sin, start, seq_len).map_err(candle_error)?;
+                    apply_rope_precomputed(&k, &cos_slice, &sin_slice).map_err(candle_error)?;
 
                 write_kv_block(&pools.k[layer_index], &pools.v[layer_index], &k, &v, &slots)
                     .map_err(candle_error)?;
@@ -963,7 +1022,7 @@ impl Qwen2Model {
                                 &pools.k[layer_index],
                                 &pools.v[layer_index],
                                 &slot_tensor,
-                                &mask,
+                                mask.as_ref(),
                                 n_rep,
                             )
                             .map_err(candle_error)?,
@@ -976,7 +1035,7 @@ impl Qwen2Model {
                             &pools.k[layer_index],
                             &pools.v[layer_index],
                             &slot_tensor,
-                            &mask,
+                            mask.as_ref(),
                             n_rep,
                         )
                         .map_err(candle_error)?
@@ -984,7 +1043,7 @@ impl Qwen2Model {
                 };
                 let attention = attention
                     .transpose(1, 2)
-                    .and_then(|tensor| tensor.reshape((1, seq_len, self.config.attention_width())))
+                    .and_then(|tensor| tensor.reshape((1, seq_len, attention_width)))
                     .map_err(candle_error)?;
                 let attention = layer.o_proj.forward(&attention).map_err(candle_error)?;
                 hidden = residual.add(&attention).map_err(candle_error)?;
@@ -994,8 +1053,18 @@ impl Qwen2Model {
                     .post_attention_layernorm
                     .forward(&hidden)
                     .map_err(candle_error)?;
-                let gate = layer.gate_proj.forward(&normalized).map_err(candle_error)?;
-                let up = layer.up_proj.forward(&normalized).map_err(candle_error)?;
+                let gate_up = layer
+                    .gate_up_proj
+                    .forward(&normalized)
+                    .map_err(candle_error)?;
+                let gate = gate_up
+                    .narrow(D::Minus1, 0, intermediate_size)
+                    .and_then(|tensor| tensor.contiguous())
+                    .map_err(candle_error)?;
+                let up = gate_up
+                    .narrow(D::Minus1, intermediate_size, intermediate_size)
+                    .and_then(|tensor| tensor.contiguous())
+                    .map_err(candle_error)?;
                 let activated = candle_nn::ops::silu(&gate).map_err(candle_error)?;
                 let mlp = layer
                     .down_proj
@@ -1011,18 +1080,7 @@ impl Qwen2Model {
             hidden.narrow(1, seq_len - 1, 1).map_err(candle_error)?
         };
         let hidden = self.norm.forward(&hidden).map_err(candle_error)?;
-        let logits = match &self.lm_head {
-            Some(head) => head.forward(&hidden).map_err(candle_error)?,
-            None => hidden
-                .matmul(
-                    &self
-                        .tied_weight
-                        .transpose(0, 1)
-                        .and_then(|weight| weight.unsqueeze(0))
-                        .map_err(candle_error)?,
-                )
-                .map_err(candle_error)?,
-        };
+        let logits = self.lm_head.forward(&hidden).map_err(candle_error)?;
         let logits = if all_logits {
             logits.squeeze(0).map_err(candle_error)?
         } else {
@@ -1086,13 +1144,16 @@ impl Qwen2Model {
             )));
         }
         let max_positions = self.cos.dim(0).map_err(candle_error)?;
-        // Per-sequence plan: absolute positions, the gathered KV row list, and
-        // the packed row range this sequence occupies.
+        let device = &self.device;
+        // Per-sequence plan: gathered KV slots and optional causal mask uploaded
+        // once before the transformer layer loop.
         struct Plan {
             rows: Vec<usize>,
             start: usize,
             len: usize,
             offset: usize,
+            slot_tensor: Option<Tensor>,
+            mask: Option<Tensor>,
         }
         let mut plans = Vec::with_capacity(inputs.len());
         let mut total_rows = 0usize;
@@ -1108,23 +1169,30 @@ impl Qwen2Model {
             let slots = block_manager
                 .slot_mapping(input.seq, 0, total_len)
                 .map_err(|err| ModelError::Backend(err.to_string()))?;
+            let mask = if len > 1 {
+                Some(causal_mask(input.start, len, total_len, device).map_err(candle_error)?)
+            } else {
+                None
+            };
             plans.push(Plan {
                 rows: slots.iter().map(|&slot| slot as usize).collect(),
                 start: input.start,
                 len,
                 offset: total_rows,
+                slot_tensor: None,
+                mask,
             });
             total_rows += len;
         }
 
-        let device = &self.device;
         let packed_tokens: Vec<u32> = inputs
             .iter()
             .flat_map(|input| input.tokens.iter().copied())
             .collect();
-        let positions: Vec<usize> = inputs
+        let positions: Vec<u32> = inputs
             .iter()
             .flat_map(|input| input.start..input.start + input.tokens.len())
+            .map(|p| p as u32)
             .collect();
         let input_ids =
             Tensor::from_vec(packed_tokens, (1, total_rows), device).map_err(candle_error)?;
@@ -1134,7 +1202,22 @@ impl Qwen2Model {
             .map_err(candle_error)?
             .reshape((total_rows, self.config.hidden_size))
             .map_err(candle_error)?;
+        let position_index =
+            Tensor::from_vec(positions, (total_rows,), device).map_err(candle_error)?;
+        let cos_rows = self
+            .cos
+            .index_select(&position_index, 0)
+            .and_then(|tensor| tensor.reshape((total_rows, 1, self.config.head_dim)))
+            .map_err(candle_error)?;
+        let sin_rows = self
+            .sin
+            .index_select(&position_index, 0)
+            .and_then(|tensor| tensor.reshape((total_rows, 1, self.config.head_dim)))
+            .map_err(candle_error)?;
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
+        let attention_width = self.config.attention_width();
+        let kv_width = self.config.num_kv_heads * self.config.head_dim;
+        let intermediate_size = self.config.intermediate_size;
 
         // One kernel launch for the whole batch when every sequence decodes a
         // single token on the f16 CUDA path.
@@ -1154,6 +1237,19 @@ impl Qwen2Model {
         } else {
             None
         };
+        #[cfg(not(feature = "cuda"))]
+        let has_batch_kernel = false;
+        #[cfg(feature = "cuda")]
+        let has_batch_kernel = batch_kernel.is_some();
+
+        if !has_batch_kernel {
+            for plan in &mut plans {
+                let row_indices: Vec<u32> = plan.rows.iter().map(|&row| row as u32).collect();
+                let count = row_indices.len();
+                plan.slot_tensor =
+                    Some(Tensor::from_vec(row_indices, (count,), device).map_err(candle_error)?);
+            }
+        }
 
         let pools = Arc::clone(&self.pools);
         let pools = pools
@@ -1171,18 +1267,27 @@ impl Qwen2Model {
                 .input_layernorm
                 .forward(&hidden)
                 .map_err(candle_error)?;
-            let q = layer.q_proj.forward(&normalized).map_err(candle_error)?;
-            let k = layer.k_proj.forward(&normalized).map_err(candle_error)?;
-            let v = layer.v_proj.forward(&normalized).map_err(candle_error)?;
-
-            let q = q
-                .reshape((total_rows, self.config.num_heads, self.config.head_dim))
+            let qkv = layer.qkv_proj.forward(&normalized).map_err(candle_error)?;
+            let q = qkv
+                .narrow(D::Minus1, 0, attention_width)
+                .and_then(|tensor| tensor.contiguous())
+                .and_then(|tensor| {
+                    tensor.reshape((total_rows, self.config.num_heads, self.config.head_dim))
+                })
                 .map_err(candle_error)?;
-            let k = k
-                .reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+            let k = qkv
+                .narrow(D::Minus1, attention_width, kv_width)
+                .and_then(|tensor| tensor.contiguous())
+                .and_then(|tensor| {
+                    tensor.reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+                })
                 .map_err(candle_error)?;
-            let v = v
-                .reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+            let v = qkv
+                .narrow(D::Minus1, attention_width + kv_width, kv_width)
+                .and_then(|tensor| tensor.contiguous())
+                .and_then(|tensor| {
+                    tensor.reshape((total_rows, self.config.num_kv_heads, self.config.head_dim))
+                })
                 .map_err(candle_error)?;
 
             let q = match &layer.q_norm {
@@ -1194,8 +1299,8 @@ impl Qwen2Model {
                 None => k,
             };
 
-            let q = apply_rope_rows(&q, &self.cos, &self.sin, &positions).map_err(candle_error)?;
-            let k = apply_rope_rows(&k, &self.cos, &self.sin, &positions).map_err(candle_error)?;
+            let q = apply_rope_precomputed(&q, &cos_rows, &sin_rows).map_err(candle_error)?;
+            let k = apply_rope_precomputed(&k, &cos_rows, &sin_rows).map_err(candle_error)?;
 
             write_kv_rows(
                 &pools.k[layer_index],
@@ -1226,33 +1331,31 @@ impl Qwen2Model {
             if let Some(attention) = batch_attention {
                 attention_rows.push(
                     attention
-                        .reshape((total_rows, self.config.attention_width()))
+                        .reshape((total_rows, attention_width))
                         .map_err(candle_error)?,
                 );
             } else {
-                for plan in &plans {
+                for plan in &mut plans {
                     let q_slice = q
                         .narrow(0, plan.offset, plan.len)
                         .and_then(|tensor| tensor.transpose(0, 1))
                         .and_then(|tensor| tensor.unsqueeze(0))
                         .map_err(candle_error)?;
-                    let rows = Tensor::from_vec(
-                        plan.rows
-                            .iter()
-                            .map(|&row| row as u32)
-                            .collect::<Vec<u32>>(),
-                        (plan.rows.len(),),
-                        device,
-                    )
-                    .map_err(candle_error)?;
-                    let mask = causal_mask(plan.start, plan.len, plan.start + plan.len, device)
-                        .map_err(candle_error)?;
+                    if plan.slot_tensor.is_none() {
+                        let row_indices: Vec<u32> =
+                            plan.rows.iter().map(|&row| row as u32).collect();
+                        plan.slot_tensor = Some(
+                            Tensor::from_vec(row_indices, (plan.rows.len(),), device)
+                                .map_err(candle_error)?,
+                        );
+                    }
+                    let slot_tensor = plan.slot_tensor.as_ref().expect("slot tensor populated");
                     let attention = gather_attention(
                         &q_slice,
                         &pools.k[layer_index],
                         &pools.v[layer_index],
-                        &rows,
-                        &mask,
+                        slot_tensor,
+                        plan.mask.as_ref(),
                         n_rep,
                     )
                     .map_err(candle_error)?;
@@ -1260,9 +1363,7 @@ impl Qwen2Model {
                         attention
                             .squeeze(0)
                             .and_then(|tensor| tensor.transpose(0, 1))
-                            .and_then(|tensor| {
-                                tensor.reshape((plan.len, self.config.attention_width()))
-                            })
+                            .and_then(|tensor| tensor.reshape((plan.len, attention_width)))
                             .map_err(candle_error)?,
                     );
                 }
@@ -1280,8 +1381,18 @@ impl Qwen2Model {
                 .post_attention_layernorm
                 .forward(&hidden)
                 .map_err(candle_error)?;
-            let gate = layer.gate_proj.forward(&normalized).map_err(candle_error)?;
-            let up = layer.up_proj.forward(&normalized).map_err(candle_error)?;
+            let gate_up = layer
+                .gate_up_proj
+                .forward(&normalized)
+                .map_err(candle_error)?;
+            let gate = gate_up
+                .narrow(D::Minus1, 0, intermediate_size)
+                .and_then(|tensor| tensor.contiguous())
+                .map_err(candle_error)?;
+            let up = gate_up
+                .narrow(D::Minus1, intermediate_size, intermediate_size)
+                .and_then(|tensor| tensor.contiguous())
+                .map_err(candle_error)?;
             let activated = candle_nn::ops::silu(&gate).map_err(candle_error)?;
             let mlp = layer
                 .down_proj
@@ -1291,12 +1402,7 @@ impl Qwen2Model {
         }
 
         let hidden = self.norm.forward(&hidden).map_err(candle_error)?;
-        let logits = match &self.lm_head {
-            Some(head) => head.forward(&hidden).map_err(candle_error)?,
-            None => hidden
-                .matmul(&self.tied_weight.transpose(0, 1).map_err(candle_error)?)
-                .map_err(candle_error)?,
-        };
+        let logits = self.lm_head.forward(&hidden).map_err(candle_error)?;
         let flat = logits
             .flatten_all()
             .and_then(|tensor| tensor.to_dtype(DType::F32))
@@ -2106,7 +2212,7 @@ mod tests {
         let slots: Vec<u32> = (0..seq_len as u32).collect();
         let slots = Tensor::from_vec(slots, (seq_len,), &device).unwrap();
         let mask = Tensor::zeros((1, 1, 1, seq_len), DType::F32, &device).unwrap();
-        let actual = gather_attention(&q, &k_pool, &v_pool, &slots, &mask, 1)
+        let actual = gather_attention(&q, &k_pool, &v_pool, &slots, Some(&mask), 1)
             .unwrap()
             .squeeze(0)
             .unwrap()
@@ -2116,6 +2222,17 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
+        let unmasked = gather_attention(&q, &k_pool, &v_pool, &slots, None, 1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .squeeze(1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(actual, unmasked);
 
         let max_error = actual
             .iter()

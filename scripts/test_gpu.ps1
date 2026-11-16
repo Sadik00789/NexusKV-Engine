@@ -30,8 +30,8 @@ try {
         Write-Output 'Model weights not present; real-weights parity tests will skip loudly.'
     }
 
-    Write-Output '--- GPU tests (--ignored --test-threads=1) ---'
-    & cargo test --features cuda -- --ignored --test-threads=1
+    Write-Output '--- GPU tests (--lib --test real_model -- --ignored --test-threads=1) ---'
+    & cargo test --features cuda --lib --test real_model -- --ignored --test-threads=1
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     if (-not $SkipSanitizer) {
