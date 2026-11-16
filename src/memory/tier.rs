@@ -305,6 +305,7 @@ impl<B: GpuBridge> TierStore<B> {
     }
 
     fn remove_host(&mut self, hash: u64) -> Option<Vec<u8>> {
+        self.host_lru.retain(|&entry| entry != hash);
         let data = self.host.remove(&hash)?;
         self.host_bytes = self.host_bytes.saturating_sub(data.len());
         Some(data)
@@ -390,7 +391,11 @@ impl<B: GpuBridge> BlockIo for TierStore<B> {
         let data_len = data.len();
         self.bridge.write_block(block, &data)?;
         if !from_disk {
-            self.remove_host(hash);
+            // Keep the host entry intact so a transactional rollback on a later
+            // block in the same prefix match can revert to Res::Swapped without
+            // losing the paged-in block bytes.
+            self.host_lru.retain(|&entry| entry != hash);
+            self.host_lru.push_back(hash);
         } else {
             self.stats.disk_loads += 1;
         }

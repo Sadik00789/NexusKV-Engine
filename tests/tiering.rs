@@ -81,6 +81,65 @@ fn tier_roundtrip_preserves_kv_bytes_through_eviction_and_page_in() {
 }
 
 #[test]
+fn tier_host_page_in_rollback_on_oom_preserves_swapped_prefix() {
+    let directory = temp_directory("host-rollback");
+    let block_bytes = 16;
+    let bridge = MemoryBridge::new(block_bytes);
+    // Keep all evicted blocks in the host LRU (disk_spills == 0).
+    let store = TierStore::new(bridge.clone(), &directory, 1 << 20).unwrap();
+    let mut block_manager = BlockSpaceManager::with_io(4, 4, 4, Box::new(store));
+
+    // Seed a 2-block prefix with recognizable KV bytes and free it.
+    let prefix: Vec<u32> = (1..=8).collect();
+    block_manager.match_or_allocate_prefix(1, &prefix).unwrap();
+    let original_blocks = block_manager.blocks_of(1);
+    let expected_0 = vec![0xAAu8; block_bytes];
+    let expected_1 = vec![0xBBu8; block_bytes];
+    bridge.set_block(original_blocks[0], expected_0.clone());
+    bridge.set_block(original_blocks[1], expected_1.clone());
+    block_manager.free_sequence(1).unwrap();
+
+    // Fill all 4 blocks with active sequences so both prefix blocks evict to host tier.
+    block_manager
+        .match_or_allocate_prefix(2, &[10, 11, 12, 13, 14, 15, 16, 17])
+        .unwrap();
+    block_manager
+        .match_or_allocate_prefix(3, &[20, 21, 22, 23, 24, 25, 26, 27])
+        .unwrap();
+    assert_eq!(block_manager.io_stats().disk_spills, 0);
+    assert!(block_manager.io_stats().swapped_out >= 2);
+
+    // Leave exactly 1 allocatable block (total 4, seq 2 holds 2 blocks, seq 4 holds 1 block).
+    block_manager.free_sequence(3).unwrap();
+    block_manager
+        .match_or_allocate_prefix(4, &[30, 31, 32, 33])
+        .unwrap();
+    assert_eq!(
+        block_manager.free_blocks_count() + block_manager.cached_blocks(),
+        1
+    );
+
+    // Attempting to match the 2-block swapped prefix must load block 0 from host
+    // and then fail with OutOfMemory on block 1, rolling block 0 back to Swapped.
+    let err = block_manager
+        .match_or_allocate_prefix(5, &prefix)
+        .unwrap_err();
+    assert_eq!(err, MemoryError::OutOfMemory);
+    block_manager.assert_invariants();
+
+    // Free space and re-match: both blocks must page back in from host intact.
+    block_manager.free_sequence(4).unwrap();
+    let hits = block_manager.match_or_allocate_prefix(6, &prefix).unwrap();
+    assert_eq!(hits, 2);
+    let restored = block_manager.blocks_of(6);
+    assert_eq!(bridge.block(restored[0]).as_ref(), Some(&expected_0));
+    assert_eq!(bridge.block(restored[1]).as_ref(), Some(&expected_1));
+    block_manager.assert_invariants();
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn host_budget_spills_oldest_blocks_and_loads_from_disk() {
     let directory = temp_directory("spill");
     let block_bytes = 16;
