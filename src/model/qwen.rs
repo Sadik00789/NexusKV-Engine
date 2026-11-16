@@ -461,10 +461,20 @@ impl CudaDecodeContext {
     fn new(
         block_manager: &BlockSpaceManager,
         seqs: &[SeqId],
+        active_lens: &[usize],
         device: &Device,
         config: &Qwen2Config,
     ) -> Result<Self, String> {
-        let (tables, lens) = block_manager.export_block_tables(seqs);
+        if seqs.len() != active_lens.len() {
+            return Err("seqs and active_lens length mismatch".to_string());
+        }
+        let (tables, _) = block_manager.export_block_tables(seqs);
+        let lens: Vec<i32> = active_lens
+            .iter()
+            .map(|&len| {
+                i32::try_from(len).map_err(|_| format!("sequence length {len} exceeds i32::MAX"))
+            })
+            .collect::<Result<Vec<i32>, String>>()?;
         let max_blocks_per_seq = block_manager.max_blocks_per_seq;
         let num_seqs = seqs.len();
         let block_tables = Tensor::from_vec(tables, (num_seqs, max_blocks_per_seq), device)
@@ -815,8 +825,20 @@ impl Qwen2Model {
                 )));
             }
         }
+        if block_manager.block_size != self.block_size {
+            return Err(ModelError::Invalid(format!(
+                "block_size mismatch: model expects {}, block_manager has {}",
+                self.block_size, block_manager.block_size
+            )));
+        }
         let seq_len = tokens.len();
         let total_len = start + seq_len;
+        let max_positions = self.cos.dim(0).map_err(candle_error)?;
+        if total_len > max_positions {
+            return Err(ModelError::Invalid(format!(
+                "sequence length {total_len} exceeds max RoPE positions {max_positions}"
+            )));
+        }
         let slots = block_manager
             .slot_mapping(seq, start, seq_len)
             .map_err(|err| ModelError::Backend(err.to_string()))?;
@@ -838,7 +860,8 @@ impl Qwen2Model {
         let n_rep = self.config.num_heads / self.config.num_kv_heads;
         #[cfg(feature = "cuda")]
         let cuda_context = if use_cuda_kernel && seq_len == 1 {
-            match CudaDecodeContext::new(block_manager, &[seq], device, &self.config) {
+            match CudaDecodeContext::new(block_manager, &[seq], &[total_len], device, &self.config)
+            {
                 Ok(context) => Some(context),
                 Err(error) => {
                     warn_cuda_attention_fallback(&error);
@@ -1056,6 +1079,13 @@ impl Qwen2Model {
             }
         }
 
+        if block_manager.block_size != self.block_size {
+            return Err(ModelError::Invalid(format!(
+                "block_size mismatch: model expects {}, block_manager has {}",
+                self.block_size, block_manager.block_size
+            )));
+        }
+        let max_positions = self.cos.dim(0).map_err(candle_error)?;
         // Per-sequence plan: absolute positions, the gathered KV row list, and
         // the packed row range this sequence occupies.
         struct Plan {
@@ -1069,6 +1099,12 @@ impl Qwen2Model {
         for input in inputs {
             let len = input.tokens.len();
             let total_len = input.start + len;
+            if total_len > max_positions {
+                return Err(ModelError::Invalid(format!(
+                    "sequence {} length {total_len} exceeds max RoPE positions {max_positions}",
+                    input.seq
+                )));
+            }
             let slots = block_manager
                 .slot_mapping(input.seq, 0, total_len)
                 .map_err(|err| ModelError::Backend(err.to_string()))?;
@@ -1103,19 +1139,21 @@ impl Qwen2Model {
         // One kernel launch for the whole batch when every sequence decodes a
         // single token on the f16 CUDA path.
         #[cfg(feature = "cuda")]
-        let batch_kernel =
-            if self.cuda_attention && inputs.iter().all(|input| input.tokens.len() == 1) {
-                let seqs: Vec<SeqId> = inputs.iter().map(|input| input.seq).collect();
-                match CudaDecodeContext::new(block_manager, &seqs, device, &self.config) {
-                    Ok(context) => Some(context),
-                    Err(error) => {
-                        warn_cuda_attention_fallback(&error);
-                        None
-                    }
+        let batch_kernel = if self.cuda_attention
+            && inputs.iter().all(|input| input.tokens.len() == 1)
+        {
+            let seqs: Vec<SeqId> = inputs.iter().map(|input| input.seq).collect();
+            let active_lens: Vec<usize> = plans.iter().map(|plan| plan.start + plan.len).collect();
+            match CudaDecodeContext::new(block_manager, &seqs, &active_lens, device, &self.config) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    warn_cuda_attention_fallback(&error);
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         let pools = Arc::clone(&self.pools);
         let pools = pools
@@ -2217,5 +2255,87 @@ mod tests {
             "unexpected error: {error}"
         );
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn decode_ignores_preallocated_future_kv_slots_and_checks_bounds() {
+        let device = Device::Cpu;
+        let config = tiny_config();
+        let var_map = VarMap::new();
+        let vb = NnVarBuilder::from_varmap(&var_map, DType::F32, &device);
+        let mut poisoned_model = Qwen2Model::load(&config, &vb, device.clone(), 64, 4, 16).unwrap();
+        let mut clean_model = Qwen2Model::load(&config, &vb, device.clone(), 64, 4, 16).unwrap();
+
+        let prompt: Vec<u32> = vec![2, 4, 6, 8];
+        let mut poisoned_mgr = BlockSpaceManager::new(64, 4, 16);
+        let mut clean_mgr = BlockSpaceManager::new(64, 4, 16);
+        poisoned_mgr.match_or_allocate_prefix(1, &prompt).unwrap();
+        clean_mgr.match_or_allocate_prefix(1, &prompt).unwrap();
+        poisoned_model
+            .forward(&mut poisoned_mgr, 1, &prompt, 0, false)
+            .unwrap();
+        clean_model
+            .forward(&mut clean_mgr, 1, &prompt, 0, false)
+            .unwrap();
+
+        // Mirror EngineActor::run_decode_batch: allocate the next decode slot AND
+        // one extra future slot (for the token to be emitted), and poison that
+        // unwritten slot in every layer's KV pool.
+        poisoned_mgr.append_tokens(1, 2).unwrap();
+        clean_mgr.append_tokens(1, 1).unwrap();
+        let poison_slot = poisoned_mgr.slot_mapping(1, prompt.len() + 1, 1).unwrap()[0] as usize;
+        {
+            let pools = poisoned_model.pools.lock().unwrap();
+            let poison =
+                Tensor::full(100.0f32, (1, config.num_kv_heads, config.head_dim), &device).unwrap();
+            for (k_pool, v_pool) in pools.k.iter().zip(pools.v.iter()) {
+                k_pool.slice_set(&poison, 0, poison_slot).unwrap();
+                v_pool.slice_set(&poison, 0, poison_slot).unwrap();
+            }
+        }
+
+        let token = [9u32];
+        let batched = poisoned_model
+            .forward_decode_batch(
+                &mut poisoned_mgr,
+                &[DecodeInput {
+                    seq: 1,
+                    tokens: &token,
+                    start: prompt.len(),
+                }],
+            )
+            .unwrap();
+        let single = poisoned_model
+            .forward(&mut poisoned_mgr, 1, &token, prompt.len(), false)
+            .unwrap();
+        let clean = clean_model
+            .forward(&mut clean_mgr, 1, &token, prompt.len(), false)
+            .unwrap();
+        for ((a, b), c) in batched[0][0]
+            .iter()
+            .zip(single[0].iter())
+            .zip(clean[0].iter())
+        {
+            assert!(
+                (a - c).abs() < 1e-6,
+                "batched read poisoned slot: {a} != {c}"
+            );
+            assert!(
+                (b - c).abs() < 1e-6,
+                "single read poisoned slot: {b} != {c}"
+            );
+        }
+
+        // Verify block_size mismatch and RoPE bounds errors.
+        let mut wrong_block = BlockSpaceManager::new(16, 8, 8);
+        wrong_block.match_or_allocate_prefix(1, &prompt).unwrap();
+        assert!(matches!(
+            clean_model.forward(&mut wrong_block, 1, &prompt, 0, false),
+            Err(ModelError::Invalid(_))
+        ));
+        assert!(matches!(
+            clean_model.forward(&mut clean_mgr, 1, &token, 16, false),
+            Err(ModelError::Invalid(_))
+        ));
     }
 }
