@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_HOST_BUDGET: usize = 512 * 1024 * 1024;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Cli {
     model: Option<PathBuf>,
     swap_dir: Option<PathBuf>,
@@ -16,10 +17,39 @@ struct Cli {
     blocks: Option<usize>,
     block_size: Option<usize>,
     max_seqs: Option<usize>,
+    show_help: bool,
+    show_version: bool,
+}
+
+fn help_text() -> String {
+    format!(
+        "nexuskv {VERSION} - Paged KV-Cache & Speculative Inference Engine\n\n\
+         USAGE:\n\
+         \tnexuskv [OPTIONS]\n\n\
+         OPTIONS:\n\
+         \t--model <DIR>         Path to dense Qwen3/Qwen2 directory (requires candle-model/cuda)\n\
+         \t--swap-dir <DIR>      Enable host/NVMe KV tiering in DIR\n\
+         \t--host-budget <BYTES> Tier host LRU budget in bytes (default: {DEFAULT_HOST_BUDGET})\n\
+         \t--blocks <N>          Physical KV block count\n\
+         \t--block-size <N>      Tokens per physical block\n\
+         \t--max-seqs <N>        Maximum concurrent sequences\n\
+         \t-h, --help            Print help information\n\
+         \t-V, --version         Print version information"
+    )
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = parse_args()?;
+    if cli.show_version {
+        println!("nexuskv {VERSION}");
+        return Ok(());
+    }
+    if cli.show_help {
+        println!("{}", help_text());
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -28,10 +58,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("==================================================");
-    tracing::info!("  NexusKV Engine: Rust 2024 Inference Runtime      ");
+    tracing::info!("  NexusKV Engine v{VERSION} (Rust 2024 Runtime)   ");
     tracing::info!("==================================================");
 
-    let cli = parse_args()?;
     #[allow(unused_mut)]
     let mut config = EngineConfig::default();
     if let Some(blocks) = cli.blocks {
@@ -165,13 +194,23 @@ fn build_state(config: EngineConfig, cli: &Cli) -> anyhow::Result<AppState> {
 }
 
 fn parse_args() -> anyhow::Result<Cli> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I, S>(arguments: I) -> anyhow::Result<Cli>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut cli = Cli {
         host_budget: DEFAULT_HOST_BUDGET,
         ..Cli::default()
     };
-    let mut arguments = std::env::args().skip(1);
+    let mut arguments = arguments.into_iter().map(Into::into);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "-h" | "--help" => cli.show_help = true,
+            "-V" | "--version" => cli.show_version = true,
             "--model" => {
                 cli.model =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
@@ -248,5 +287,39 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("Ctrl+C received, shutting down"),
         _ = terminate => tracing::info!("SIGTERM received, shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_supports_version_help_and_options() {
+        let version = parse_args_from(["--version"]).unwrap();
+        assert!(version.show_version);
+        assert!(!version.show_help);
+
+        let short_help = parse_args_from(["-h"]).unwrap();
+        assert!(short_help.show_help);
+        assert!(help_text().contains(VERSION));
+
+        let full = parse_args_from([
+            "--blocks",
+            "32",
+            "--block-size",
+            "8",
+            "--max-seqs",
+            "4",
+            "--host-budget",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(full.blocks, Some(32));
+        assert_eq!(full.block_size, Some(8));
+        assert_eq!(full.max_seqs, Some(4));
+        assert_eq!(full.host_budget, 1024);
+
+        assert!(parse_args_from(["--unknown-flag"]).is_err());
     }
 }
