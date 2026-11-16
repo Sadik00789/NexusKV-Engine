@@ -779,8 +779,7 @@ impl BlockSpaceManager {
         };
         let prompt_blocks = table.prompt_len / self.block_size;
         let mut valid_blocks = 0usize;
-        for block_index in 0..prompt_blocks.min(table.physical_block_ids.len()) {
-            let block = table.physical_block_ids[block_index];
+        for &block in table.physical_block_ids.iter().take(prompt_blocks) {
             let Some(node) = self.node_of[block] else {
                 break;
             };
